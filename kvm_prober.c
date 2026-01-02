@@ -1,14 +1,3 @@
-/*
- * KVM Prober - Userspace Tool v2.2
- * Companion tool for kvm_probe_drv.c
- * 
- * FIXES:
- * - Security disabling now forces through driver
- * - VMX handlers display details
- * - Symbol lookup shows all matches
- * - Guest memory mapping and gap scanning
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -571,12 +560,6 @@ void hypercall_batch(void) {
     } else {
         printf("    HC 102: 0x%lx\n", result.ret_102);
     }
-    
-    if (result.ret_103 != 0 && result.ret_103 != ~0UL) {
-        printf("[+] HC 103: 0x%lx\n", result.ret_103);
-    } else {
-        printf("    HC 103: 0x%lx\n", result.ret_103);
-    }
 }
 
 void hypercall_scan(unsigned long start, unsigned long end) {
@@ -624,8 +607,6 @@ void test_ctf_hypercalls(void) {
     
     printf("\n=== Hypercall 102 (Relative Read - KASAN) ===\n");
     do_hypercall(102, 0, 0, 0, 0);
-    
-    printf("\n=== Hypercall 103 (DoS) - SKIPPED (dangerous) ===\n");
     
     printf("\n[*] CTF hypercall test complete\n");
 }
