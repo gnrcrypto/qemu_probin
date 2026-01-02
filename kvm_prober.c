@@ -48,6 +48,7 @@
 #define IOCTL_READ_PFN_DATA          (IOCTL_BASE + 0x1C)
 #define IOCTL_MAP_GUEST_MEMORY       (IOCTL_BASE + 0x1D)
 #define IOCTL_SCAN_UNMAPPED_REGIONS  (IOCTL_BASE + 0x1E)
+#define IOCTL_SCAN_FOR_DATA          (IOCTL_BASE + 0x1F)
 
 #define IOCTL_WRITE_KERNEL_MEM       (IOCTL_BASE + 0x20)
 #define IOCTL_WRITE_PHYSICAL_MEM     (IOCTL_BASE + 0x21)
@@ -324,6 +325,15 @@ struct guest_memory_map {
     unsigned long size;
     int num_regions;
     unsigned long regions[64][2];
+};
+
+struct scan_for_data_request {
+    unsigned long start_addr;
+    unsigned long end_addr;
+    unsigned long step;
+    unsigned long *results;
+    int max_results;
+    int region_type;
 };
 
 /* Global Variables */
@@ -730,51 +740,77 @@ void map_guest_memory(void) {
     }
 }
 
-void scan_unmapped_for_data(unsigned long start, unsigned long end, const char *pattern_hex) {
-    struct scan_request req = {0};
+void scan_unmapped_for_data(unsigned long start, unsigned long end) {
+    struct scan_for_data_request req;
+    unsigned long *results;
+    int max_results = 1000;
+    int found;
     
-    printf("[!] WARNING: Scanning unmapped regions may be unstable\n");
-    printf("[*] Mapped regions (safe):\n");
+    printf("[!] Scanning unmapped regions for ANY non-zero data\n");
+    printf("[*] This will scan 0x%lx - 0x%lx\n", start, end);
+    printf("[*] Errors will be handled gracefully and scan will continue\n\n");
     
-    /* First show mapped regions */
+    /* First show mapped regions for context */
+    printf("[*] Current memory map:\n");
     map_guest_memory();
     
-    printf("\n[*] Press Enter to continue with unmapped scan, or Ctrl+C to abort...\n");
+    printf("\n[*] Press Enter to start scanning unmapped regions, or Ctrl+C to abort...\n");
     getchar();
     
-    int plen = parse_hex_pattern(pattern_hex, req.pattern.pattern, 16);
-    if (plen < 0) { 
-        printf("[-] Invalid pattern\n"); 
-        return; 
-    }
-    
-    size_t max_results = 256;
-    unsigned long *results = malloc(max_results * sizeof(unsigned long));
+    results = malloc(max_results * sizeof(unsigned long));
     if (!results) { 
         perror("malloc"); 
         return; 
     }
     
-    req.region.start = start;
-    req.region.end = end;
-    req.region.step = 0x1000;  /* Page-aligned scan */
-    req.region.buffer = (unsigned char *)results;
-    req.region.buffer_size = max_results * sizeof(unsigned long);
-    req.region.region_type = 0;  /* Physical memory */
-    req.pattern.pattern_len = plen;
-    req.pattern.match_offset = -1;
+    req.start_addr = start;
+    req.end_addr = end;
+    req.step = 0x1000;  /* Page-aligned scan */
+    req.results = results;
+    req.max_results = max_results;
+    req.region_type = 0;  /* Physical memory */
     
-    printf("[*] Scanning unmapped region 0x%lx-0x%lx for pattern...\n", start, end);
+    printf("[*] Scanning... (this may take a while)\n");
+    printf("[*] Kernel will skip errors and continue\n\n");
     
-    int found = ioctl(fd, IOCTL_SCAN_MEMORY_REGION, &req);
+    found = ioctl(fd, IOCTL_SCAN_FOR_DATA, &req);
+    
     if (found > 0) {
-        printf("[+] Found %d matches in unmapped regions:\n", found);
-        for (int i = 0; i < found && i < (int)max_results; i++)
-            printf("  [%d] 0x%lx\n", i, results[i]);
+        printf("[+] Found %d addresses with non-zero data:\n\n", found);
+        
+        /* Group nearby addresses */
+        printf("    %-18s %s\n", "Address", "Notes");
+        printf("    %-18s %s\n", "-------", "-----");
+        
+        for (int i = 0; i < found && i < max_results; i++) {
+            unsigned long addr = results[i];
+            
+            /* Check if this is a gap between known regions */
+            int in_gap = 0;
+            if (i == 0 || (i > 0 && (addr - results[i-1]) > 0x100000)) {
+                /* New region or significant gap */
+                if (i > 0) printf("\n");
+                printf("    0x%016lx  <-- Data found\n", addr);
+            } else if ((addr - results[i-1]) <= 0x10000) {
+                /* Close to previous, likely same region */
+                printf("    0x%016lx\n", addr);
+            } else {
+                printf("    0x%016lx\n", addr);
+            }
+        }
+        
+        if (found >= max_results) {
+            printf("\n[!] Maximum results (%d) reached, scan incomplete\n", max_results);
+        }
+        
+        printf("\n[*] Scan complete. Read these addresses to see actual data:\n");
+        printf("    sudo ./kvm_prober read_phys <addr> 0x100\n");
+        
     } else if (found == 0) {
-        printf("[-] No matches found\n");
+        printf("[-] No non-zero data found in unmapped regions\n");
+        printf("    (All scanned addresses were zero or inaccessible)\n");
     } else {
-        printf("[-] Scan failed (may have hit invalid memory)\n");
+        printf("[-] Scan failed with error: %d\n", found);
     }
     
     free(results);
@@ -1260,7 +1296,7 @@ void print_help(void) {
     
     printf("GUEST MEMORY MAPPING:\n");
     printf("  map_guest                    - Map all guest memory regions\n");
-    printf("  scan_unmapped <start> <end> <pattern> - Scan unmapped for data\n\n");
+    printf("  scan_unmapped <start> <end>  - Scan unmapped for ANY data\n\n");
     
     printf("MEMORY READ OPERATIONS:\n");
     printf("  read_kernel <addr> <size>    - Read kernel virtual memory\n");
@@ -1334,8 +1370,8 @@ int main(int argc, char *argv[]) {
     
     /* Guest memory mapping */
     else if (strcmp(cmd, "map_guest") == 0) map_guest_memory();
-    else if (strcmp(cmd, "scan_unmapped") == 0 && argc > 4)
-        scan_unmapped_for_data(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0), argv[4]);
+    else if (strcmp(cmd, "scan_unmapped") == 0 && argc > 3)
+        scan_unmapped_for_data(strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0));
     
     /* Memory read operations */
     else if (strcmp(cmd, "read_kernel") == 0 && argc > 3) 
