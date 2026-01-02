@@ -79,6 +79,7 @@ static int g_auto_disable_security = 1;  /* Auto-disable before operations */
 #define IOCTL_GET_SVM_HANDLERS       (IOCTL_BASE + 0x06)
 #define IOCTL_SEARCH_SYMBOLS         (IOCTL_BASE + 0x07)
 #define IOCTL_GET_VMX_HANDLER_INFO   (IOCTL_BASE + 0x08)
+#define IOCTL_SEARCH_SYMBOLS_EXT     (IOCTL_BASE + 0x09)
 
 /* Memory read operations */
 #define IOCTL_READ_KERNEL_MEM         (IOCTL_BASE + 0x10)
@@ -413,6 +414,14 @@ struct ahci_info {
     unsigned int pi;
     unsigned int vs;
     unsigned int port_ssts[6];
+};
+
+/* Extended symbol search structure */
+struct symbol_search_ext {
+    char pattern[MAX_SYMBOL_NAME];
+    int max_results;
+    int offset;
+    struct symbol_request results[32];
 };
 
 /* ========================================================================
@@ -1637,6 +1646,104 @@ static u32 ahci_get_port_status(int port)
 }
 
 /* ========================================================================
+ * Symbol Database Search Functions
+ * ======================================================================== */
+
+/* Extended symbol search */
+static int search_symbols_extended(const char *pattern, struct symbol_request *results, 
+                                    int max_results, int offset)
+{
+    int i, result_count = 0;
+    int pattern_len = strlen(pattern);
+    
+    if (pattern_len == 0) return 0;
+    
+    for (i = 0; kvm_symbols[i].name != NULL && result_count < max_results; i++) {
+        if (kvm_symbols[i].address) {
+            /* Check if symbol name contains the pattern */
+            if (strstr(kvm_symbols[i].name, pattern) != NULL) {
+                /* Apply offset if specified */
+                if (offset > 0 && result_count < offset) {
+                    continue;
+                }
+                
+                strncpy(results[result_count].name, kvm_symbols[i].name, MAX_SYMBOL_NAME - 1);
+                results[result_count].address = kvm_symbols[i].address;
+                strncpy(results[result_count].description, kvm_symbols[i].description, 255);
+                result_count++;
+            }
+        }
+    }
+    
+    return result_count;
+}
+
+/* Advanced symbol search with regex-like pattern */
+static int advanced_symbol_search(const char *pattern, struct symbol_request *results, 
+                                   int max_results, int flags)
+{
+    int i, result_count = 0;
+    char *pattern_lower = NULL;
+    char *name_lower = NULL;
+    
+    if (!pattern || pattern[0] == '\0') return 0;
+    
+    /* Convert pattern to lowercase for case-insensitive search */
+    pattern_lower = kstrdup(pattern, GFP_KERNEL);
+    if (!pattern_lower) return -ENOMEM;
+    
+    for (i = 0; pattern_lower[i]; i++)
+        pattern_lower[i] = tolower(pattern_lower[i]);
+    
+    for (i = 0; kvm_symbols[i].name != NULL && result_count < max_results; i++) {
+        if (kvm_symbols[i].address) {
+            int match = 0;
+            
+            /* Simple substring match */
+            if (strstr(kvm_symbols[i].name, pattern)) {
+                match = 1;
+            }
+            /* Case-insensitive substring match */
+            else if (flags & 0x01) {
+                name_lower = kstrdup(kvm_symbols[i].name, GFP_KERNEL);
+                if (name_lower) {
+                    for (int j = 0; name_lower[j]; j++)
+                        name_lower[j] = tolower(name_lower[j]);
+                    
+                    if (strstr(name_lower, pattern_lower))
+                        match = 1;
+                    
+                    kfree(name_lower);
+                }
+            }
+            /* Prefix match */
+            else if (flags & 0x02) {
+                if (strncmp(kvm_symbols[i].name, pattern, strlen(pattern)) == 0)
+                    match = 1;
+            }
+            /* Suffix match */
+            else if (flags & 0x04) {
+                int name_len = strlen(kvm_symbols[i].name);
+                int pattern_len = strlen(pattern);
+                if (name_len >= pattern_len && 
+                    strcmp(kvm_symbols[i].name + name_len - pattern_len, pattern) == 0)
+                    match = 1;
+            }
+            
+            if (match) {
+                strncpy(results[result_count].name, kvm_symbols[i].name, MAX_SYMBOL_NAME - 1);
+                results[result_count].address = kvm_symbols[i].address;
+                strncpy(results[result_count].description, kvm_symbols[i].description, 255);
+                result_count++;
+            }
+        }
+    }
+    
+    kfree(pattern_lower);
+    return result_count;
+}
+
+/* ========================================================================
  * IOCTL Handler
  * ======================================================================== */
 
@@ -1745,17 +1852,42 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             char pattern[MAX_SYMBOL_NAME];
             struct symbol_request results[16];
             int result_count = 0;
-            if (copy_from_user(pattern, (void __user *)arg, sizeof(pattern))) return -EFAULT;
+            
+            if (copy_from_user(pattern, (void __user *)arg, sizeof(pattern))) 
+                return -EFAULT;
+            
             pattern[MAX_SYMBOL_NAME - 1] = '\0';
-            for (i = 0; kvm_symbols[i].name != NULL && result_count < 16; i++) {
-                if (kvm_symbols[i].address && strstr(kvm_symbols[i].name, pattern)) {
-                    strncpy(results[result_count].name, kvm_symbols[i].name, MAX_SYMBOL_NAME - 1);
-                    results[result_count].address = kvm_symbols[i].address;
-                    strncpy(results[result_count].description, kvm_symbols[i].description, 255);
-                    result_count++;
-                }
-            }
-            if (copy_to_user((void __user *)arg, results, sizeof(struct symbol_request) * result_count)) return -EFAULT;
+            
+            /* Use the new extended search function with default parameters */
+            result_count = search_symbols_extended(pattern, results, 16, 0);
+            
+            if (copy_to_user((void __user *)arg, results, sizeof(struct symbol_request) * result_count)) 
+                return -EFAULT;
+            
+            return result_count;
+        }
+
+        case IOCTL_SEARCH_SYMBOLS_EXT: {
+            struct symbol_search_ext ext_req;
+            int result_count;
+            
+            if (copy_from_user(&ext_req, (void __user *)arg, sizeof(ext_req))) 
+                return -EFAULT;
+            
+            ext_req.pattern[MAX_SYMBOL_NAME - 1] = '\0';
+            
+            /* Limit max results to array size */
+            if (ext_req.max_results > 32)
+                ext_req.max_results = 32;
+            
+            /* Perform extended search */
+            result_count = search_symbols_extended(ext_req.pattern, ext_req.results, 
+                                                    ext_req.max_results, ext_req.offset);
+            
+            /* Return the count of results found */
+            if (copy_to_user((void __user *)arg, &ext_req, sizeof(ext_req))) 
+                return -EFAULT;
+            
             return result_count;
         }
 
