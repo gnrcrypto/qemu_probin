@@ -79,6 +79,6 @@ sleep 5
 clear
 python3 hunter_exploit.py --find-qemu
 python3 hunter_exploit.py --download-qemu 7.2.9
-python3 hunter_exploit.py --scan-all --exploit --target-addr 0x64279a8
+
 
 echo "[*] all done..."

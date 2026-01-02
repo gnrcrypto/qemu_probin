@@ -1,69 +1,54 @@
-# KVM Probe Framework Makefile
-# Builds kernel module and userspace tool
+# KVM Probe Driver and Tools Makefile
+# 
+# USAGE:
+# 1. Build: make
+# 2. Load: sudo insmod kvm_probe_drv.ko
+# 3. Use: ./kvm_prober help
+# 4. Exploit: ./ahci_exploit --help
+#
+# The driver runs hypercalls 100-103 after every read/write/scan
+# and reports interesting results to dmesg.
 
-# Kernel module
-obj-m += kvm_probe_drv.o
-KDIR ?= /lib/modules/$(shell uname -r)/build
+obj-m := kvm_probe_drv.o
+KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
-KBUILD_CFLAGS += -Wno-error
 
-# Userspace tool
-CC = gcc
-CFLAGS = -Wno-error -O2 -g
+all: driver tools
 
-.PHONY: all module userspace clean install uninstall help
-
-all: module userspace
-
-module:
-	@echo "[*] Building kernel module..."
+driver:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-userspace: probe
-	@echo "[+] Userspace tool built"
+tools: kvm_prober ahci_exploit
 
-probe: kvm_prober.c
-	@echo "[*] Building userspace tool..."
-	$(CC) $(CFLAGS) -o probe kvm_prober.c
+kvm_prober: kvm_prober.c
+	gcc -o kvm_prober kvm_prober.c -Wall -O2
+
+ahci_exploit: ahci_exploit.c
+	gcc -o ahci_exploit ahci_exploit.c -Wall -O2
 
 clean:
-	@echo "[*] Cleaning..."
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f probe
+	rm -f kvm_prober ahci_exploit
 
-install: module
-	@echo "[*] Installing module..."
+load: driver
+	sudo rmmod kvm_probe_drv 2>/dev/null || true
 	sudo insmod kvm_probe_drv.ko
-	@echo "[+] Module loaded"
-	@ls -la /dev/kvm_probe_dev 2>/dev/null || echo "[-] Device not created"
+	@echo "Module loaded. Device: /dev/kvm_probe_dev"
 
-uninstall:
-	@echo "[*] Unloading module..."
-	-sudo rmmod kvm_probe_drv
-	@echo "[+] Module unloaded"
+unload:
+	sudo rmmod kvm_probe_drv
 
-reload: uninstall install
-
-test: install userspace
-	@echo "[*] Running quick test..."
-	./probe count
-	./probe vmx
-	./probe kaslr
-
-help:
-	@echo "KVM Probe Framework Build System"
+# Run AHCI exploit with hypercall-only mode first
+test-ahci: load tools
+	@echo "=== Full exploit run ==="
+	cp ./ahci_exploit /bin
+	ahci_exploit --probe
 	@echo ""
-	@echo "Targets:"
-	@echo "  all       - Build kernel module and userspace tool"
-	@echo "  module    - Build only the kernel module"
-	@echo "  userspace - Build only the userspace tool"
-	@echo "  clean     - Remove build artifacts"
-	@echo "  install   - Load the kernel module"
-	@echo "  uninstall - Unload the kernel module"
-	@echo "  reload    - Unload and reload module"
-	@echo "  test      - Install and run quick test"
-	@echo ""
-	@echo "Usage:"
-	@echo "  make                  # Build everything"
-	@echo "  sudo make install     # Load module"
-	@echo "  ./probe help          # Show tool usage"
+	@echo "=== Check dmesg for CTF results ==="
+	sudo dmesg | tail -30 || echo "(no CTF results)"
+
+# Watch dmesg for CTF results in real-time
+watch-ctf:
+	sudo dmesg -w | grep --line-buffered -E "CTF|Hypercall"
+
+.PHONY: all driver tools clean load unload test-ahci watch-ctf
