@@ -1421,7 +1421,7 @@ void print_help(void) {
     printf("  vmx / svm                    - Show handler info (DETAILED)\n\n");
     
     printf("GUEST MEMORY MAPPING:\n");
-    printf("  map_guest                    - Map all guest memory regions\n");
+    printf("  map_guest - ***BROKEN***     - Will freeze and boot/reset server\n");
     printf("  scan_unmapped <start> <end>  - Scan unmapped for ANY data\n\n");
     
     printf("MEMORY READ OPERATIONS:\n");

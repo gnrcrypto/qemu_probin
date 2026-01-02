@@ -972,12 +972,38 @@ static int map_guest_memory(struct guest_memory_map *map)
     int region_count = 0;
     unsigned long region_start = 0;
     int in_region = 0;
+    int ret;
     
-    printk(KERN_INFO "%s: Mapping guest memory regions...\n", DRIVER_NAME);
+    /* Initialize the map */
+    memset(map, 0, sizeof(*map));
     
-    /* Scan from 0 to 4GB in 2MB chunks */
-    for (gpa = 0; gpa < 0x100000000UL && region_count < 64; gpa += 0x200000) {
-        int ret = read_physical_memory(gpa, &test_byte, 1);
+    printk(KERN_INFO "%s: SAFELY mapping guest memory regions...\n", DRIVER_NAME);
+    printk(KERN_INFO "%s: Scanning limited range for safety\n", DRIVER_NAME);
+    
+    /* SAFETY LIMIT: Only scan up to 256MB for safety */
+    unsigned long scan_limit = 0x10000000;  /* 256MB */
+    
+    /* SAFETY: Use smaller chunk size for better granularity */
+    unsigned long chunk_size = 0x1000;  /* 4KB pages */
+    
+    /* SAFETY: Add timeout check */
+    unsigned long start_jiffies = jiffies;
+    unsigned long timeout = start_jiffies + HZ * 30;  /* 30 second timeout */
+    
+    for (gpa = 0; gpa < scan_limit && region_count < 64; gpa += chunk_size) {
+        /* SAFETY: Check for timeout */
+        if (time_after(jiffies, timeout)) {
+            printk(KERN_WARNING "%s: Memory mapping timeout at GPA 0x%lx\n", DRIVER_NAME, gpa);
+            break;
+        }
+        
+        /* SAFETY: Allow preemption every 256 iterations */
+        if ((gpa & 0xFFFFFF) == 0) {
+            cond_resched();
+        }
+        
+        /* SAFETY: Try to read with error handling */
+        ret = read_physical_memory(gpa, &test_byte, 1);
         
         if (ret == 0) {
             /* Valid memory */
@@ -986,12 +1012,24 @@ static int map_guest_memory(struct guest_memory_map *map)
                 in_region = 1;
             }
         } else {
-            /* Invalid/unmapped */
+            /* Invalid/unmapped or error */
             if (in_region) {
                 map->regions[region_count][0] = region_start;
                 map->regions[region_count][1] = gpa;
                 region_count++;
                 in_region = 0;
+                
+                printk(KERN_DEBUG "%s: Found region %d: 0x%lx-0x%lx\n", 
+                       DRIVER_NAME, region_count-1, region_start, gpa);
+            }
+            
+            /* SAFETY: Skip larger gaps quickly */
+            if (ret == -EFAULT || ret == -EINVAL) {
+                /* Skip 1MB at a time for large unmapped areas */
+                unsigned long skip = 0x100000;
+                if (gpa + skip < scan_limit) {
+                    gpa += skip - chunk_size;  /* Adjust for loop increment */
+                }
             }
         }
     }
@@ -1001,20 +1039,30 @@ static int map_guest_memory(struct guest_memory_map *map)
         map->regions[region_count][0] = region_start;
         map->regions[region_count][1] = gpa;
         region_count++;
+        
+        printk(KERN_DEBUG "%s: Final region %d: 0x%lx-0x%lx\n", 
+               DRIVER_NAME, region_count-1, region_start, gpa);
     }
     
     map->num_regions = region_count;
+    
     if (region_count > 0) {
         map->start_gpa = map->regions[0][0];
         map->end_gpa = map->regions[region_count-1][1];
         map->size = 0;
         for (int i = 0; i < region_count; i++) {
-            map->size += map->regions[i][1] - map->regions[i][0];
+            unsigned long region_size = map->regions[i][1] - map->regions[i][0];
+            map->size += region_size;
+            
+            printk(KERN_INFO "%s: Region %d: 0x%lx-0x%lx (size: 0x%lx / %lu KB)\n",
+                   DRIVER_NAME, i, 
+                   map->regions[i][0], map->regions[i][1],
+                   region_size, region_size / 1024);
         }
     }
     
-    printk(KERN_INFO "%s: Found %d guest memory regions, total size: 0x%lx\n",
-           DRIVER_NAME, region_count, map->size);
+    printk(KERN_INFO "%s: SAFELY found %d guest memory regions, total size: 0x%lx (%lu MB)\n",
+           DRIVER_NAME, region_count, map->size, map->size / (1024*1024));
     
     return 0;
 }
