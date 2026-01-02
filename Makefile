@@ -22,18 +22,24 @@ tools: kvm_prober ahci_exploit
 
 kvm_prober: kvm_prober.c
 	gcc -o kvm_prober kvm_prober.c -Wall -O2
+	cp kvm_prober /bin
 
 ahci_exploit: ahci_exploit.c
 	gcc -o ahci_exploit ahci_exploit.c -Wall -O2
+	cp ahci_exploit /bin
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f kvm_prober ahci_exploit
+	rm /bin/kvm_prober
+	rm /bin/ahci_exploit
 
-load: driver
+install: driver
 	sudo rmmod kvm_probe_drv 2>/dev/null || true
 	sudo insmod kvm_probe_drv.ko
 	@echo "Module loaded. Device: /dev/kvm_probe_dev"
+	sudo cp kvm_prober /bin
+	sudo cp ahci_exploit /bin
 
 unload:
 	sudo rmmod kvm_probe_drv
@@ -51,4 +57,4 @@ test-ahci: load tools
 watch-ctf:
 	sudo dmesg -w | grep --line-buffered -E "CTF|Hypercall"
 
-.PHONY: all driver tools clean load unload test-ahci watch-ctf
+.PHONY: all driver tools clean install unload test-ahci watch-ctf
