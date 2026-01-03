@@ -1,3 +1,15 @@
+/* 
+ * KVM Probe Driver - Core Infrastructure v2.2
+ * Builds KVM exploitation primitives step by step
+ * 
+ * FIXES:
+ * - CR register writes now use direct assembly for better control
+ * - Auto-disable security features before sensitive operations
+ * - Enhanced hypercall support with better result parsing
+ * - Guest memory mapping and gap analysis
+ * - Added cache operations and AHCI support
+ */
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
