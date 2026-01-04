@@ -1,0 +1,122 @@
+# Quick Reference: Real vs False Positive Findings
+
+## Report.json Vulnerability Status
+
+### ✅ FALSE POSITIVES - 285 Items (Safe to Ignore)
+
+#### Logging/Tracing (Don't Matter)
+```
+qemu_log_mask()
+trace_ahci_populate_sglist_no_map()
+qemu_format_nic_info_str()
+```
+→ Return value irrelevant for logging
+
+#### Framework Callbacks (Already Handled)
+```
+type_init()
+pci_set_word()
+pci_realize()
+qemu_irq_raise()
+```
+→ Framework handles errors, not caller's responsibility
+
+#### Cleanup Operations (Best Effort)
+```
+qemu_sglist_destroy()
+memory_region_init()
+qemu_bh_schedule()
+```
+→ Designed to degrade gracefully
+
+---
+
+## ⚠️ REAL VULNERABILITIES - 15 Items (Need Fixing)
+
+### MEDIUM Severity (4 items)
+
+#### 1. DMA Memory Unmap - ahci.c:1008
+```c
+// VULNERABLE
+dma_memory_unmap(ad->hba->as, prdt, prdt_len,
+                 DMA_DIRECTION_TO_DEVICE, prdt_len);  // Return ignored!
+
+// FIXED
+int ret = dma_memory_unmap(ad->hba->as, prdt, prdt_len,
+                           DMA_DIRECTION_TO_DEVICE, prdt_len);
+if (ret != 0) error_report("DMA unmap failed");
+```
+**Impact**: Resource leak → Memory exhaustion → DOS
+
+#### 2. DMA Memory Unmap - ahci.c:1396
+Same as above, different location.
+
+#### 3. Scatter-Gather Add - ahci.c:996
+```c
+// VULNERABLE
+qemu_sglist_add(sglist, le64_to_cpu(tbl[off_idx].addr) + off_pos,
+                MIN(prdt_tbl_entry_size - off_pos, len));  // No check
+
+// FIXED
+if (qemu_sglist_add(...) < 0) {
+    error_report("Failed to add to sglist");
+    return -1;
+}
+```
+**Impact**: Invalid buffer → Data corruption → Potential escape
+
+#### 4. Scatter-Gather Add - ahci.c:1001
+Same pattern as above.
+
+---
+
+### LOW-MEDIUM Severity (8-11 items)
+
+#### e1000e Device Initialization
+```c
+// Lines 437-456, 444, 454
+pci_register_bar()      // Return unchecked
+memory_region_init()    // Return unchecked
+pcie_dev_ser_num_init() // Return unchecked
+```
+**Impact**: Device setup in degraded state → Unpredictable behavior
+
+---
+
+## Action Items
+
+| Item | Type | File | Lines | Status |
+|------|------|------|-------|--------|
+| DMA unmap error | Error check | ahci.c | 1008 | 🔴 NEEDS FIX |
+| DMA unmap error | Error check | ahci.c | 1396 | 🔴 NEEDS FIX |
+| SG list error | Error check | ahci.c | 996 | 🔴 NEEDS FIX |
+| SG list error | Error check | ahci.c | 1001 | 🔴 NEEDS FIX |
+| Init errors | Error check | e1000e.c | 437+ | 🟡 REVIEW |
+
+---
+
+## Testing
+
+### Before Fix
+```bash
+# Monitor for resource leaks
+valgrind --leak-check=full qemu-system-x86_64 -drive file=disk.qcow2,if=ide
+```
+
+### After Fix
+```bash
+# Stress test with many I/O operations
+fio --filename=/dev/sda --direct=1 --rw=randrw --bs=4k --size=10G --numjobs=8
+```
+
+---
+
+## Bottom Line
+
+✅ **285 false positives** - Ignore logging/framework return checks  
+🔴 **4 MUST FIX** - DMA and SG list error handling  
+🟡 **8-11 REVIEW** - Device initialization paths  
+
+**Effort**: 2-4 hours to fix all  
+**Risk**: Currently MEDIUM, drops to LOW after fixes  
+**Deadline**: Can be addressed in next sprint

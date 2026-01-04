@@ -1,4 +1,4 @@
-{
+[{
   "device": "ahci",
   "files_scanned": 1,
   "findings": [
@@ -160,7 +160,8 @@
     }
   ],
   "timestamp": "2026-01-04 14:38:25"
-}{
+},
+{
   "device": "e1000e",
   "files_scanned": 2,
   "findings": [
@@ -2959,7 +2960,8 @@
     }
   ],
   "timestamp": "2026-01-04 14:38:25"
-}{
+},
+{
   "device": "nvme",
   "files_scanned": 4,
   "findings": [
@@ -7253,7 +7255,8 @@
     }
   ],
   "timestamp": "2026-01-04 14:38:25"
-}{
+},
+{
   "device": "xhci",
   "files_scanned": 4,
   "findings": [
@@ -7428,4 +7431,4 @@
       "code_snippet": "err:\n    qemu_sglist_destroy(&xfer->sgl);\n    xhci_die(xhci);\n    return -1;"
     }
   ],
-  "timestamp": "2026-01-04 14:38:25"
+  "timestamp": "2026-01-04 14:38:25"}]
