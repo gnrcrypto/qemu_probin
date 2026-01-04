@@ -948,7 +948,7 @@ static inline bool is_valid_phys_addr(unsigned long phys_addr)
     return phys_addr < max_pfn << PAGE_SHIFT;
 }
 
-static unsigned long read_cr_register(int cr_num)
+static unsigned long __maybe_unused read_cr_register(int cr_num)
 {
 #ifdef CONFIG_X86
     switch (cr_num) {
@@ -1604,7 +1604,7 @@ static void clflush_addr(void *addr)
 }
 
 /* CLFLUSHOPT on a specific virtual address (if available) */
-static void clflushopt_addr(void *addr)
+static void __maybe_unused clflushopt_addr(void *addr)
 {
     asm volatile("clflushopt (%0)" :: "r"(addr) : "memory");
 }
@@ -1626,7 +1626,6 @@ static int write_physical_and_flush(unsigned long phys_addr, const unsigned char
                                      size_t size)
 {
     void *virt_addr;
-    int ret;
     unsigned long orig_cr0 = 0;
 
     printk(KERN_INFO "%s: write_physical_and_flush: phys=0x%lx size=%zu\n",
@@ -1783,6 +1782,14 @@ struct ahci_fis_request {
     u32 port;
     u64 fis_base;
     u64 clb_base;
+};
+
+struct ahci_info {
+    u32 cap;
+    u32 ghc;
+    u32 pi;
+    u32 vs;
+    u32 port_ssts[6];
 };
 
 #ifdef CONFIG_X86
@@ -2657,25 +2664,9 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 }
             }
 
-                case 1:  /* GVA */
-                {
-                    struct gva_translate_request greq;
-                    memset(&greq, 0, sizeof(greq));
-                    greq.gva = req.gva;
-                    greq.cr3 = req.cr3;
-                    ret = translate_gva_to_gpa(req.gva, req.cr3, &greq);
-                    if (ret == 0 && greq.gpa) {
-                        /* Prefer HVA if available */
-                        if (greq.hva && virt_addr_valid(greq.hva)) {
-                            ret = write_kernel_memory(greq.hva, kbuf, req.length, 1);
-                        } else {
-                            ret = write_physical_memory(greq.gpa, kbuf, req.length, 0);
-                        }
-                    } else {
-                        ret = -EFAULT;
-                    }
-                }
-                break;
+            kfree(kbuf);
+            return ret;
+        }
 
         case IOCTL_READ_GUEST_MEM: {
             struct guest_mem_read req;
@@ -2997,24 +2988,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             }
 
-                {
-                    struct gva_translate_request greq;
-                    memset(&greq, 0, sizeof(greq));
-                    greq.gva = req.gva;
-                    greq.cr3 = req.cr3;
-                    ret = translate_gva_to_gpa(req.gva, req.cr3, &greq);
-                    if (ret == 0 && greq.gpa) {
-                        /* Prefer HVA if available */
-                        if (greq.hva && virt_addr_valid(greq.hva)) {
-                            ret = read_kernel_memory(greq.hva, kbuf, req.length);
-                        } else {
-                            ret = read_physical_memory(greq.gpa, kbuf, req.length);
-                        }
-                    } else {
-                        ret = -EFAULT;
-                    }
-                }
-                break;
+            kfree(kbuf);
             return ret;
         }
 
@@ -3600,27 +3574,29 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
             if (ahci_map_mmio() < 0) {
                 return -EIO;
-                /* First try direct map */
-#ifdef CONFIG_X86
-                req.hva = (unsigned long)__va(gpa);
-#else
-                req.hva = (unsigned long)phys_to_virt(gpa);
-#endif
-                if (req.hva && virt_addr_valid(req.hva)) {
-                    req.status = 0;
-                } else {
-                    struct phys_to_virt_request pv;
-                    memset(&pv, 0, sizeof(pv));
-                    pv.phys_addr = gpa;
-                    pv.use_ioremap = 0;
-                    if (convert_phys_to_virt(gpa, &pv) == 0 && pv.virt_addr) {
-                        req.hva = pv.virt_addr;
-                        req.status = 0;
-                    } else {
-                        req.hva = 0;
-                        req.status = -EFAULT;
-                    }
-                }
+            }
+
+            /* Read from AHCI controller at specified port/offset */
+            if (req.port >= 6 || !ahci_mmio) {
+                return -EINVAL;
+            }
+
+            if (req.port < 6) {
+                req.value = ahci_read32(AHCI_PORT_BASE(req.port) + req.offset);
+            } else {
+                req.value = ahci_read32(req.offset);
+            }
+
+            printk(KERN_INFO "%s: AHCI read port %d offset 0x%x = 0x%x\n",
+                   DRIVER_NAME, req.port, req.offset, req.value);
+
+            if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
+                return -EFAULT;
+            }
+
+            return 0;
+        }
+
         case IOCTL_AHCI_WRITE_REG: {
             struct ahci_reg_request req;
 
@@ -3669,14 +3645,8 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         }
 
         case IOCTL_AHCI_INFO: {
-            u32 cap, ghc, pi, vs;
-            struct {
-                u32 cap;
-                u32 ghc;
-                u32 pi;
-                u32 vs;
-                u32 port_ssts[6];
-            } info;
+            struct ahci_info info;
+            int i;
 
             if (ahci_map_mmio() < 0) {
                 return -EIO;

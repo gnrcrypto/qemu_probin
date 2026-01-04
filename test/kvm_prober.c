@@ -90,6 +90,13 @@ struct mem_region {
     int region_type;
 };
 
+/* Memory pattern for scanning */
+struct mem_pattern {
+    unsigned char pattern[16];
+    size_t pattern_len;
+    int match_offset;           /* -1 for any offset */
+};
+
 /* MSR read request */
 struct msr_read_request {
     unsigned int msr;
@@ -784,7 +791,8 @@ int read_pfn_data(unsigned long phys_addr, void *buffer, size_t length)
 }
 
 int scan_memory_region_ext(struct mem_region *region, struct mem_pattern *pattern,
-                           unsigned long *results, int max_results)
+                           unsigned long *results __attribute__((unused)), 
+                           int max_results __attribute__((unused)))
 {
     struct {
         struct mem_region region;
@@ -817,7 +825,7 @@ int find_memory_pattern_ext(unsigned long start, unsigned long end,
     req.start = start;
     req.end = end;
     memset(req.pattern, 0, sizeof(req.pattern));
-    memcpy(req.pattern, pattern, min(pattern_len, sizeof(req.pattern)));
+    memcpy(req.pattern, pattern, (pattern_len < sizeof(req.pattern)) ? pattern_len : sizeof(req.pattern));
     req.pattern_len = pattern_len;
     req.found_addr = 0;
 
