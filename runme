@@ -67,6 +67,7 @@ clear
 
 echo "[*] Building and Installing prober + hypercall programs..."
 
+cd test
 make KCFLAGS="-Wno-error"
 make KCFLAGS="-Wno-error" install
 cp kvm_prober /bin
@@ -77,8 +78,8 @@ echo "[*] Clearing screan and prepping for exploit..."
 
 sleep 5
 clear
-python3 hunter_exploit.py --find-qemu
-python3 hunter_exploit.py --download-qemu 7.2.9
+python3 ../hunter_exploit.py --find-qemu
+python3 ../hunter_exploit.py --download-qemu 7.2.9
 
 
 echo "[*] all done..."
