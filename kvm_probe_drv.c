@@ -1341,7 +1341,7 @@ static int convert_hva_to_pfn(unsigned long hva, struct hva_to_pfn_request *req)
         mmap_read_lock(current->mm);
         
         #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
-        ret = get_user_pages(hva, 1, FOLL_GET, &page);
+        ret = get_user_pages(hva, 1, FOLL_GET, &page, NULL);
         #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
         ret = get_user_pages(hva, 1, FOLL_GET | FOLL_FORCE, &page, NULL);
         #else
