@@ -77,6 +77,7 @@ struct guest_mem_read {
     unsigned long length;
     unsigned char *user_buffer;
     int mode;
+    unsigned long cr3;
 };
 
 /* Memory region descriptor */
@@ -165,6 +166,7 @@ struct guest_mem_write {
     unsigned long length;
     unsigned char *user_buffer;
     int mode;
+    unsigned long cr3;
 };
 
 /* MSR write request */
@@ -673,6 +675,272 @@ int dump_page_tables(unsigned long vaddr, struct page_table_dump *dump)
 
     if (ioctl(g_fd, IOCTL_DUMP_PAGE_TABLES, dump) < 0) {
         fprintf(stderr, "%s[ERROR]%s Dump page tables failed: %s\n",
+                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+int read_ept_pointers(unsigned long eptp, struct ept_pointer_request *out)
+{
+    if (open_device() < 0) return -1;
+
+    memset(out, 0, sizeof(*out));
+    out->eptp = eptp;
+
+    if (ioctl(g_fd, IOCTL_READ_EPT_POINTERS, out) < 0) {
+        fprintf(stderr, "%s[ERROR]%s Read EPT pointers failed: %s\n",
+                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+int read_guest_registers(struct guest_registers *out)
+{
+    if (open_device() < 0) return -1;
+
+    memset(out, 0, sizeof(*out));
+
+    if (ioctl(g_fd, IOCTL_READ_GUEST_REGISTERS, out) < 0) {
+        if (errno == ENOSYS) {
+            fprintf(stderr, "%s[WARN]%s Reading guest registers not supported on this build\n",
+                    COLOR_YELLOW, COLOR_RESET);
+        } else {
+            fprintf(stderr, "%s[ERROR]%s Read guest registers failed: %s\n",
+                    COLOR_RED, COLOR_RESET, strerror(errno));
+        }
+        return -1;
+    }
+
+    return 0;
+}
+
+int read_guest_memory_ext(unsigned long gpa, unsigned long gva, size_t length,
+                         int mode, unsigned long cr3, void *buffer)
+{
+    struct guest_mem_read req;
+
+    if (open_device() < 0) return -1;
+
+    req.gpa = gpa;
+    req.gva = gva;
+    req.length = length;
+    req.user_buffer = buffer;
+    req.mode = mode;
+    req.cr3 = cr3;
+
+    if (ioctl(g_fd, IOCTL_READ_GUEST_MEM, &req) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s Read guest mem failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+int write_guest_memory_ext(unsigned long gpa, unsigned long gva, size_t length,
+                          int mode, unsigned long cr3, void *buffer)
+{
+    struct guest_mem_write req;
+
+    if (open_device() < 0) return -1;
+
+    req.gpa = gpa;
+    req.gva = gva;
+    req.length = length;
+    req.user_buffer = buffer;
+    req.mode = mode;
+    req.cr3 = cr3;
+
+    if (ioctl(g_fd, IOCTL_WRITE_GUEST_MEM, &req) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s Write guest mem failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+int read_pfn_data(unsigned long phys_addr, void *buffer, size_t length)
+{
+    struct physical_mem_read req;
+
+    if (open_device() < 0) return -1;
+
+    req.phys_addr = phys_addr;
+    req.length = length;
+    req.user_buffer = buffer;
+
+    if (ioctl(g_fd, IOCTL_READ_PFN_DATA, &req) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s Read PFN data failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+int scan_memory_region_ext(struct mem_region *region, struct mem_pattern *pattern,
+                           unsigned long *results, int max_results)
+{
+    struct {
+        struct mem_region region;
+        struct mem_pattern pattern;
+    } scan_req;
+
+    if (open_device() < 0) return -1;
+
+    memcpy(&scan_req.region, region, sizeof(*region));
+    memcpy(&scan_req.pattern, pattern, sizeof(*pattern));
+
+    if (ioctl(g_fd, IOCTL_SCAN_MEMORY_REGION, &scan_req) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s Scan memory region failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    /* Driver writes results into region.buffer; caller should have provided buffer */
+    return 0;
+}
+
+int find_memory_pattern_ext(unsigned long start, unsigned long end,
+                            const unsigned char *pattern, size_t pattern_len,
+                            unsigned long *found_addr)
+{
+    struct pattern_search_request req;
+
+    if (open_device() < 0) return -1;
+
+    req.start = start;
+    req.end = end;
+    memset(req.pattern, 0, sizeof(req.pattern));
+    memcpy(req.pattern, pattern, min(pattern_len, sizeof(req.pattern)));
+    req.pattern_len = pattern_len;
+    req.found_addr = 0;
+
+    if (ioctl(g_fd, IOCTL_FIND_MEMORY_PATTERN, &req) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s Find memory pattern failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    *found_addr = req.found_addr;
+    return 0;
+}
+
+int gpa_to_hva(unsigned long gpa, struct gpa_to_hva_request *out)
+{
+    if (open_device() < 0) return -1;
+    memset(out, 0, sizeof(*out));
+    out->gpa = gpa;
+
+    if (ioctl(g_fd, IOCTL_GPA_TO_HVA, out) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s GPA->HVA failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return out->status == 0 ? 0 : -1;
+}
+
+int gfn_to_hva(unsigned long gfn, struct gfn_to_hva_request *out)
+{
+    if (open_device() < 0) return -1;
+    memset(out, 0, sizeof(*out));
+    out->gfn = gfn;
+
+    if (ioctl(g_fd, IOCTL_GFN_TO_HVA, out) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s GFN->HVA failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return out->status == 0 ? 0 : -1;
+}
+
+int gfn_to_pfn(unsigned long gfn, struct gfn_to_pfn_request *out)
+{
+    if (open_device() < 0) return -1;
+    memset(out, 0, sizeof(*out));
+    out->gfn = gfn;
+
+    if (ioctl(g_fd, IOCTL_GFN_TO_PFN, out) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s GFN->PFN failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return out->status == 0 ? 0 : -1;
+}
+
+int spte_to_pfn(unsigned long spte, struct spte_to_pfn_request *out)
+{
+    if (open_device() < 0) return -1;
+    memset(out, 0, sizeof(*out));
+    out->spte = spte;
+
+    if (ioctl(g_fd, IOCTL_SPTE_TO_PFN, out) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s SPTE->PFN failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return out->status == 0 ? 0 : -1;
+}
+
+int translate_gva(unsigned long gva, unsigned long cr3, struct gva_translate_request *out)
+{
+    if (open_device() < 0) return -1;
+    memset(out, 0, sizeof(*out));
+    out->gva = gva;
+    out->cr3 = cr3;
+
+    if (ioctl(g_fd, IOCTL_TRANSLATE_GVA, out) < 0) {
+        if (g_verbose) fprintf(stderr, "%s[ERROR]%s Translate GVA failed: %s\n",
+                                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return out->status == 0 ? 0 : -1;
+}
+
+int read_phys_page(unsigned long phys_addr, void *buffer)
+{
+    struct physical_mem_read req;
+
+    if (open_device() < 0) return -1;
+
+    req.phys_addr = phys_addr;
+    req.length = PAGE_SIZE;
+    req.user_buffer = buffer;
+
+    if (ioctl(g_fd, IOCTL_READ_PHYS_PAGE, &req) < 0) {
+        fprintf(stderr, "%s[ERROR]%s Read phys page failed: %s\n",
+                COLOR_RED, COLOR_RESET, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+int copy_kernel_mem(unsigned long src_addr, unsigned long dst_addr, unsigned long length,
+                    int src_type, int dst_type)
+{
+    struct memcpy_request req;
+
+    if (open_device() < 0) return -1;
+
+    req.src_addr = src_addr;
+    req.dst_addr = dst_addr;
+    req.length = length;
+    req.src_type = src_type;
+    req.dst_type = dst_type;
+
+    if (ioctl(g_fd, IOCTL_COPY_KERNEL_MEM, &req) < 0) {
+        fprintf(stderr, "%s[ERROR]%s Copy kernel mem failed: %s\n",
                 COLOR_RED, COLOR_RESET, strerror(errno));
         return -1;
     }
@@ -1279,35 +1547,91 @@ int run_all_tests(void)
 void print_usage(const char *progname)
 {
     printf("Usage: %s [options] <command> [args]\n\n", progname);
-    printf("Commands:\n");
-    printf("  test                    Run all tests\n");
-    printf("  test_symbols            Test symbol operations\n");
-    printf("  test_memory             Test memory read operations\n");
-    printf("  test_addr               Test address conversion\n");
-    printf("  test_hypercalls         Test hypercall operations\n");
-    printf("  test_ctf_hypercalls     Run CTF hypercall test suite\n");
-    printf("  test_ahci               Test AHCI operations\n");
-    printf("\n");
-    printf("  lookup <symbol>         Look up a kernel symbol\n");
-    printf("  read_kmem <addr> <len>  Read kernel memory\n");
-    printf("  read_phys <addr> <len>  Read physical memory\n");
-    printf("  read_msr <msr>          Read MSR\n");
-    printf("  kaslr                   Show KASLR information\n");
-    printf("\n");
-    printf("  hypercall <nr> [a0-a3]  Execute single hypercall\n");
-    printf("  hypercall_batch         Execute CTF hypercalls 100-103\n");
-    printf("  hypercall_detect        Detect hypercall instruction type\n");
-    printf("  probe_hc <start> <end>  Probe hypercall range\n");
-    printf("\n");
-    printf("  ahci_init               Initialize AHCI controller\n");
-    printf("  ahci_info               Show AHCI controller info\n");
-    printf("  ahci_read <port> <off>  Read AHCI register\n");
-    printf("  ahci_write <p> <o> <v>  Write AHCI register\n");
-    printf("\n");
+    printf("Basic commands:\n");
+    printf("  test\t\tRun full test suite\n");
+    printf("  test_symbols\tTest symbol operations\n");
+    printf("  test_memory\tTest memory read operations\n");
+    printf("  test_addr\tTest address conversion\n");
+    printf("  test_hypercalls\tTest hypercall operations\n");
+    printf("  test_ahci\tTest AHCI operations\n\n");
+
+    printf("Memory & conversion:\n");
+    printf("  read_kmem <addr> <len>    Read kernel memory\n");
+    printf("  read_phys <addr> <len>    Read physical memory\n");
+    printf("  read_phys_page <phys>     Read one physical page\n");
+    printf("  read_guest <mode> <addr> <len> [cr3]\n");
+    printf("  write_guest <mode> <addr> <len> [cr3]\n");
+    printf("  copy_kmem <src> <dst> <len> <s> <d>\n\n");
+
+    printf("Translations & paging:\n");
+    printf("  gpa_to_hva <gpa>\tConvert GPA to HVA\n");
+    printf("  gfn_to_hva <gfn>\tConvert GFN to HVA\n");
+    printf("  gfn_to_pfn <gfn>\tConvert GFN to PFN\n");
+    printf("  spte_to_pfn <spte>\tExtract PFN from SPTE\n");
+    printf("  translate_gva <gva> <cr3>\tTranslate guest virtual to GPA/HVA\n");
+    printf("  read_ept_ptr <eptp>\tRead EPT pointers from EPTP\n\n");
+
+    printf("Hypercalls & AHCI:\n");
+    printf("  hypercall <nr> [a0-a3]\tExecute single hypercall\n");
+    printf("  hypercall_batch\tExecute CTF hypercalls 100-103\n");
+    printf("  hypercall_detect\tDetect hypercall instruction type\n");
+    printf("  ahci_init\t\tInitialize AHCI controller\n");
+    printf("  ahci_info\t\tShow AHCI controller info\n");
+    printf("  ahci_read <port> <off>\tRead AHCI register\n\n");
+
+    printf("Utilities:\n");
+    printf("  lookup <symbol>\tLook up a kernel symbol\n");
+    printf("  kaslr\t\tShow KASLR information\n");
+    printf("  read_msr <msr>\tRead MSR\n");
+    printf("  find_pattern <start> <end> <hex>\tFind byte pattern (hex string, e.g. deadbeef)\n\n");
+
+    printf("For detailed usage of a specific command run: %s help <command>\n", progname);
     printf("Options:\n");
-    printf("  -v, --verbose           Verbose output\n");
-    printf("  -h, --help              Show this help\n");
-    printf("\n");
+    printf("  -v, --verbose\tVerbose output\n");
+    printf("  -h, --help\t\tShow this help\n\n");
+}
+
+/* Print per-command help for clearer guidance */
+void print_command_help(const char *progname, const char *cmd)
+{
+    if (!cmd) { print_usage(progname); return; }
+
+    if (strcmp(cmd, "read_kmem") == 0) {
+        printf("Usage: %s read_kmem <addr> <len>\n    Read kernel memory at <addr> for <len> bytes.\n", progname);
+        return;
+    }
+    if (strcmp(cmd, "read_phys") == 0) {
+        printf("Usage: %s read_phys <addr> <len>\n    Read physical memory at <addr> for <len> bytes.\n", progname);
+        return;
+    }
+    if (strcmp(cmd, "read_guest") == 0) {
+        printf("Usage: %s read_guest <mode:gpa|gva|gfn> <addr> <len> [cr3]\n", progname);
+        printf("    mode=gpa: read by guest physical address\n");
+        printf("    mode=gva: read by guest virtual address (requires CR3)\n");
+        printf("    mode=gfn: read by guest frame number\n");
+        return;
+    }
+    if (strcmp(cmd, "write_guest") == 0) {
+        printf("Usage: %s write_guest <mode:gpa|gva|gfn> <addr> <len> [cr3]\n", progname);
+        printf("    Write guest memory; providing CR3 enables GVA translations.\n");
+        return;
+    }
+    if (strcmp(cmd, "translate_gva") == 0) {
+        printf("Usage: %s translate_gva <gva> <cr3>\n    Translate guest virtual address to GPA/HVA using CR3.\n", progname);
+        return;
+    }
+    if (strcmp(cmd, "gpa_to_hva") == 0) {
+        printf("Usage: %s gpa_to_hva <gpa>\n    Convert a guest physical address to a host virtual address if possible.\n", progname);
+        return;
+    }
+    if (strcmp(cmd, "find_pattern") == 0) {
+        printf("Usage: %s find_pattern <start> <end> <hexpattern>\n    Search memory region for given hex byte pattern (no spaces).\n", progname);
+        return;
+    }
+
+    /* Fallback */
+    printf("No detailed help available for '%s'\n", cmd);
+    printf("Run: %s help <command>\n", progname);
 }
 
 int main(int argc, char *argv[])
@@ -1339,6 +1663,16 @@ int main(int argc, char *argv[])
     }
 
     const char *cmd = argv[optind];
+
+    /* Provide per-command help: `help <command>` */
+    if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0) {
+        if (optind + 1 < argc) {
+            print_command_help(argv[0], argv[optind + 1]);
+        } else {
+            print_usage(argv[0]);
+        }
+        return 0;
+    }
 
     /* Test commands */
     if (strcmp(cmd, "test") == 0) {
@@ -1525,6 +1859,165 @@ int main(int argc, char *argv[])
         }
         close_device();
         return ret;
+    }
+
+    /* New guest/utility commands */
+    if (strcmp(cmd, "read_guest") == 0) {
+        if (optind + 3 >= argc) {
+            fprintf(stderr, "usage: read_guest <mode:gpa|gva|gfn> <addr> <len> [cr3]\n");
+            return 1;
+        }
+        const char *mode = argv[optind+1];
+        unsigned long addr = strtoul(argv[optind+2], NULL, 0);
+        size_t len = strtoul(argv[optind+3], NULL, 0);
+        unsigned long cr3 = 0;
+        if (optind + 4 < argc) cr3 = strtoul(argv[optind+4], NULL, 0);
+        int m = 0;
+        if (strcmp(mode, "gpa") == 0) m = 0;
+        else if (strcmp(mode, "gva") == 0) m = 1;
+        else if (strcmp(mode, "gfn") == 0) m = 2;
+        else { fprintf(stderr, "unknown mode\n"); return 1; }
+        unsigned char *buf = malloc(len);
+        if (!buf) return 1;
+        if (read_guest_memory_ext(m==0?addr:0, m==1?addr:0, len, m, cr3, buf) == 0) {
+            hexdump(buf, len, addr);
+        }
+        free(buf);
+        close_device();
+        return 0;
+    }
+
+    if (strcmp(cmd, "write_guest") == 0) {
+        if (optind + 3 >= argc) {
+            fprintf(stderr, "usage: write_guest <mode:gpa|gva|gfn> <addr> <len> [cr3]\n");
+            return 1;
+        }
+        const char *mode = argv[optind+1];
+        unsigned long addr = strtoul(argv[optind+2], NULL, 0);
+        size_t len = strtoul(argv[optind+3], NULL, 0);
+        unsigned long cr3 = 0;
+        if (optind + 4 < argc) cr3 = strtoul(argv[optind+4], NULL, 0);
+        int m = 0;
+        if (strcmp(mode, "gpa") == 0) m = 0;
+        else if (strcmp(mode, "gva") == 0) m = 1;
+        else if (strcmp(mode, "gfn") == 0) m = 2;
+        else { fprintf(stderr, "unknown mode\n"); return 1; }
+        unsigned char *buf = malloc(len);
+        if (!buf) return 1;
+        memset(buf, 0, len); /* placeholder data */
+        int ret = write_guest_memory_ext(m==0?addr:0, m==1?addr:0, len, m, cr3, buf);
+        free(buf);
+        close_device();
+        return ret == 0 ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "read_phys_page") == 0) {
+        if (optind + 1 >= argc) { fprintf(stderr, "usage: read_phys_page <phys_addr>\n"); return 1; }
+        unsigned long phys = strtoul(argv[optind+1], NULL, 0);
+        unsigned char buf[PAGE_SIZE];
+        if (read_phys_page(phys, buf) == 0) {
+            hexdump(buf, PAGE_SIZE, phys);
+        }
+        close_device();
+        return 0;
+    }
+
+    if (strcmp(cmd, "copy_kmem") == 0) {
+        if (optind + 5 >= argc) { fprintf(stderr, "usage: copy_kmem <src> <dst> <len> <s> <d>\n"); return 1; }
+        unsigned long src = strtoul(argv[optind+1], NULL, 0);
+        unsigned long dst = strtoul(argv[optind+2], NULL, 0);
+        unsigned long len = strtoul(argv[optind+3], NULL, 0);
+        int s = atoi(argv[optind+4]);
+        int d = atoi(argv[optind+5]);
+        int ret = copy_kernel_mem(src, dst, len, s, d);
+        close_device();
+        return ret == 0 ? 0 : 1;
+    }
+
+    if (strcmp(cmd, "gpa_to_hva") == 0) {
+        if (optind + 1 >= argc) { fprintf(stderr, "usage: gpa_to_hva <gpa>\n"); return 1; }
+        unsigned long gpa = strtoul(argv[optind+1], NULL, 0);
+        struct gpa_to_hva_request out;
+        if (gpa_to_hva(gpa, &out) == 0) printf("HVA=0x%lx status=%d\n", out.hva, out.status);
+        close_device();
+        return 0;
+    }
+
+    if (strcmp(cmd, "gfn_to_hva") == 0) {
+        if (optind + 1 >= argc) { fprintf(stderr, "usage: gfn_to_hva <gfn>\n"); return 1; }
+        unsigned long gfn = strtoul(argv[optind+1], NULL, 0);
+        struct gfn_to_hva_request out;
+        if (gfn_to_hva(gfn, &out) == 0) printf("HVA=0x%lx status=%d\n", out.hva, out.status);
+        close_device();
+        return 0;
+    }
+
+    if (strcmp(cmd, "gfn_to_pfn") == 0) {
+        if (optind + 1 >= argc) { fprintf(stderr, "usage: gfn_to_pfn <gfn>\n"); return 1; }
+        unsigned long gfn = strtoul(argv[optind+1], NULL, 0);
+        struct gfn_to_pfn_request out;
+        if (gfn_to_pfn(gfn, &out) == 0) printf("PFN=0x%lx status=%d\n", out.pfn, out.status);
+        close_device();
+        return 0;
+    }
+
+    if (strcmp(cmd, "spte_to_pfn") == 0) {
+        if (optind + 1 >= argc) { fprintf(stderr, "usage: spte_to_pfn <spte>\n"); return 1; }
+        unsigned long spte = strtoul(argv[optind+1], NULL, 0);
+        struct spte_to_pfn_request out;
+        if (spte_to_pfn(spte, &out) == 0) printf("PFN=0x%lx flags=0x%lx present=%d writable=%d exec=%d\n",
+                                                out.pfn, out.flags, out.present, out.writable, out.executable);
+        close_device();
+        return 0;
+    }
+
+    if (strcmp(cmd, "translate_gva") == 0) {
+        if (optind + 1 >= argc) { fprintf(stderr, "usage: translate_gva <gva> <cr3>\n"); return 1; }
+        unsigned long gva = strtoul(argv[optind+1], NULL, 0);
+        unsigned long cr3 = 0;
+        if (optind + 2 < argc) cr3 = strtoul(argv[optind+2], NULL, 0);
+        struct gva_translate_request out;
+        if (translate_gva(gva, cr3, &out) == 0) printf("GPA=0x%lx HVA=0x%lx status=%d\n", out.gpa, out.hva, out.status);
+        close_device();
+        return 0;
+    }
+
+    if (strcmp(cmd, "read_ept_ptr") == 0) {
+        if (optind + 1 >= argc) { fprintf(stderr, "usage: read_ept_ptr <eptp>\n"); return 1; }
+        unsigned long eptp = strtoul(argv[optind+1], NULL, 0);
+        struct ept_pointer_request out;
+        if (read_ept_pointers(eptp, &out) == 0) printf("root_hpa=0x%lx level=%d\n", out.root_hpa, out.level);
+        close_device();
+        return 0;
+    }
+
+    if (strcmp(cmd, "read_guest_regs") == 0) {
+        struct guest_registers regs;
+        if (read_guest_registers(&regs) == 0) {
+            printf("RAX=0x%lx RIP=0x%lx CR3=0x%lx\n", regs.rax, regs.rip, regs.cr3);
+        } else {
+            fprintf(stderr, "Failed to read guest registers\n");
+        }
+        close_device();
+        return 0;
+    }
+
+    if (strcmp(cmd, "find_pattern") == 0) {
+        if (optind + 3 >= argc) { fprintf(stderr, "usage: find_pattern <start> <end> <hexpattern>\n"); return 1; }
+        unsigned long start = strtoul(argv[optind+1], NULL, 0);
+        unsigned long end = strtoul(argv[optind+2], NULL, 0);
+        const char *hex = argv[optind+3];
+        unsigned char pattern[16]; size_t plen = 0;
+        size_t hexlen = strlen(hex);
+        for (size_t i = 0; i+1 < hexlen && plen < sizeof(pattern); i+=2) {
+            unsigned int byte;
+            if (sscanf(&hex[i], "%2x", &byte) == 1) pattern[plen++] = byte;
+        }
+        unsigned long found = 0;
+        if (find_memory_pattern_ext(start, end, pattern, plen, &found) == 0) printf("Found at 0x%lx\n", found);
+        else printf("Not found\n");
+        close_device();
+        return 0;
     }
 
     fprintf(stderr, "Unknown command: %s\n", cmd);
