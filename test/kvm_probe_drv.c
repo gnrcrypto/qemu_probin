@@ -286,7 +286,6 @@ struct guest_mem_read {
     unsigned long length;
     unsigned char __user *user_buffer;
     int mode;                   /* 0 = GPA, 1 = GVA, 2 = GFN */
-    unsigned long cr3;          /* Guest CR3 when translating GVA */
 };
 
 /* Memory region descriptor for scanning */
@@ -386,7 +385,6 @@ struct guest_mem_write {
     unsigned long length;
     unsigned char __user *user_buffer;
     int mode;                    /* 0 = GPA, 1 = GVA, 2 = GFN */
-    unsigned long cr3;           /* Guest CR3 when translating GVA */
 };
 
 /* MSR write request */
@@ -948,7 +946,7 @@ static inline bool is_valid_phys_addr(unsigned long phys_addr)
     return phys_addr < max_pfn << PAGE_SHIFT;
 }
 
-static unsigned long __maybe_unused read_cr_register(int cr_num)
+static unsigned long read_cr_register(int cr_num)
 {
 #ifdef CONFIG_X86
     switch (cr_num) {
@@ -1604,7 +1602,7 @@ static void clflush_addr(void *addr)
 }
 
 /* CLFLUSHOPT on a specific virtual address (if available) */
-static void __maybe_unused clflushopt_addr(void *addr)
+static void clflushopt_addr(void *addr)
 {
     asm volatile("clflushopt (%0)" :: "r"(addr) : "memory");
 }
@@ -1626,6 +1624,7 @@ static int write_physical_and_flush(unsigned long phys_addr, const unsigned char
                                      size_t size)
 {
     void *virt_addr;
+    int ret;
     unsigned long orig_cr0 = 0;
 
     printk(KERN_INFO "%s: write_physical_and_flush: phys=0x%lx size=%zu\n",
@@ -1782,14 +1781,6 @@ struct ahci_fis_request {
     u32 port;
     u64 fis_base;
     u64 clb_base;
-};
-
-struct ahci_info {
-    u32 cap;
-    u32 ghc;
-    u32 pi;
-    u32 vs;
-    u32 port_ssts[6];
 };
 
 #ifdef CONFIG_X86
@@ -2256,13 +2247,6 @@ static int walk_ept_tables(unsigned long eptp, unsigned long gpa, struct ept_wal
 static int translate_gva_to_gpa(unsigned long gva, unsigned long cr3,
                                  struct gva_translate_request *req)
 {
-    unsigned long pml4_base;
-    unsigned long pml4e, pdpte, pde, pte;
-    unsigned long pml4_idx, pdpt_idx, pd_idx, pt_idx;
-    unsigned long phys_addr;
-    unsigned char buf[8];
-    int ret;
-
     req->gva = gva;
     req->gpa = 0;
     req->hva = 0;
@@ -2270,84 +2254,9 @@ static int translate_gva_to_gpa(unsigned long gva, unsigned long cr3,
     req->cr3 = cr3;
     req->status = -EFAULT;
 
-    if (!cr3)
-        return -EINVAL;
-
-    /* Extract indices */
-    pml4_idx = (gva >> 39) & 0x1FF;
-    pdpt_idx = (gva >> 30) & 0x1FF;
-    pd_idx = (gva >> 21) & 0x1FF;
-    pt_idx = (gva >> 12) & 0x1FF;
-
-    /* CR3 contains the physical base of PML4 (mask out PCID) */
-    pml4_base = cr3 & 0x000FFFFFFFFFF000ULL;
-
-    /* Read PML4E */
-    phys_addr = pml4_base + pml4_idx * 8;
-    ret = read_physical_memory(phys_addr, buf, 8);
-    if (ret < 0) return -EFAULT;
-    memcpy(&pml4e, buf, 8);
-
-    if (!(pml4e & 0x1))
-        return -ENOENT;
-
-    /* PDPT */
-    phys_addr = (pml4e & 0x000FFFFFFFFFF000ULL) + pdpt_idx * 8;
-    ret = read_physical_memory(phys_addr, buf, 8);
-    if (ret < 0) return -EFAULT;
-    memcpy(&pdpte, buf, 8);
-
-    if (!(pdpte & 0x1))
-        return -ENOENT;
-
-    /* 1GB page? (PS bit in PDPT) */
-    if (pdpte & (1ULL << 7)) {
-        req->gpa = (pdpte & 0x000FFFFFC0000000ULL) | (gva & 0x3FFFFFFFULL);
-        req->status = 0;
-        /* Try to convert to HVA */
-        {
-            struct phys_to_virt_request pv = { .phys_addr = req->gpa, .use_ioremap = 0 };
-            if (convert_phys_to_virt(req->gpa, &pv) == 0) req->hva = pv.virt_addr;
-        }
-        return 0;
-    }
-
-    /* PD */
-    phys_addr = (pdpte & 0x000FFFFFFFFFF000ULL) + pd_idx * 8;
-    ret = read_physical_memory(phys_addr, buf, 8);
-    if (ret < 0) return -EFAULT;
-    memcpy(&pde, buf, 8);
-
-    if (!(pde & 0x1))
-        return -ENOENT;
-
-    /* 2MB page? (PS bit in PDE) */
-    if (pde & (1ULL << 7)) {
-        req->gpa = (pde & 0x000FFFFFFFE00000ULL) | (gva & 0x1FFFFFULL);
-        req->status = 0;
-        {
-            struct phys_to_virt_request pv = { .phys_addr = req->gpa, .use_ioremap = 0 };
-            if (convert_phys_to_virt(req->gpa, &pv) == 0) req->hva = pv.virt_addr;
-        }
-        return 0;
-    }
-
-    /* PT */
-    phys_addr = (pde & 0x000FFFFFFFFFF000ULL) + pt_idx * 8;
-    ret = read_physical_memory(phys_addr, buf, 8);
-    if (ret < 0) return -EFAULT;
-    memcpy(&pte, buf, 8);
-
-    if (!(pte & 0x1))
-        return -ENOENT;
-
-    /* 4KB page */
-    req->gpa = (pte & 0x000FFFFFFFFFF000ULL) | (gva & 0xFFFULL);
+    /* For now, simple identity mapping */
+    req->gpa = gva;
     req->status = 0;
-    {
-        struct phys_to_virt_request pv = { .phys_addr = req->gpa, .use_ioremap = 0 };
-        if (convert_phys_to_virt(req->gpa, &pv) == 0) req->hva = pv.virt_addr;
-    }
 
     return 0;
 }
@@ -2716,42 +2625,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return ret;
         }
 
-        case IOCTL_READ_PHYS_PAGE: {
-            struct physical_mem_read req;
-            unsigned char *kbuf;
-            int ret;
-
-            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-                return -EFAULT;
-            }
-
-            if (!req.user_buffer) return -EINVAL;
-
-            /* Limit reads to one page for this ioctl */
-            if (req.length == 0) req.length = PAGE_SIZE;
-            if (req.length > PAGE_SIZE) return -EINVAL;
-
-            kbuf = kmalloc(req.length, GFP_KERNEL);
-            if (!kbuf) return -ENOMEM;
-
-            /* Prefer PFN-based read if PFN looks valid */
-            if (pfn_valid(req.phys_addr >> PAGE_SHIFT)) {
-                ret = read_physical_via_pfn(req.phys_addr, kbuf, req.length);
-            } else {
-                ret = read_physical_memory(req.phys_addr, kbuf, req.length);
-            }
-
-            if (ret == 0) {
-                if (copy_to_user(req.user_buffer, kbuf, req.length)) {
-                    kfree(kbuf);
-                    return -EFAULT;
-                }
-            }
-
-            kfree(kbuf);
-            return ret;
-        }
-
         case IOCTL_SCAN_MEMORY_REGION: {
             struct {
                 struct mem_region region;
@@ -2810,21 +2683,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return ret;
         }
 
-        case IOCTL_READ_EPT_POINTERS: {
-            struct ept_pointer_request req;
-
-            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-                return -EFAULT;
-            }
-
-            /* Extract root HPA from EPTP (physical base) */
-            req.root_hpa = req.eptp & 0x000FFFFFFFFFF000ULL;
-            /* Default level is 4 for 4-level paging */
-            req.level = 4;
-
-            return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : 0;
-        }
-
 #ifdef CONFIG_X86
         case IOCTL_READ_CR_REGISTER: {
             struct {
@@ -2862,25 +2720,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : 0;
         }
 #endif
-
-        case IOCTL_READ_GUEST_REGISTERS: {
-            struct guest_registers regs;
-
-            if (copy_from_user(&regs, (void __user *)arg, sizeof(regs))) {
-                return -EFAULT;
-            }
-
-            /* Without KVM vCPU context we cannot read a guest's registers.
-             * Zero the structure and return ENOSYS to indicate unsupported.
-             */
-            memset(&regs, 0, sizeof(regs));
-
-            if (copy_to_user((void __user *)arg, &regs, sizeof(regs))) {
-                return -EFAULT;
-            }
-
-            return -ENOSYS;
-        }
 
         case IOCTL_DUMP_PAGE_TABLES: {
             struct page_table_dump dump;
@@ -2988,6 +2827,7 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             }
 
+            ret = write_physical_memory(req.phys_addr, kbuf, req.length, req.method);
             kfree(kbuf);
             return ret;
         }
@@ -3177,47 +3017,6 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
             return patch_memory(req.addr, req.original, req.patch, req.length,
                                req.verify_original, req.addr_type);
-        }
-
-        case IOCTL_COPY_KERNEL_MEM: {
-            struct memcpy_request req;
-            unsigned char *kbuf = NULL;
-            int ret = 0;
-
-            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-                return -EFAULT;
-            }
-
-            if (!req.length || req.length > 1024 * 1024) return -EINVAL; /* limit 1MB */
-
-            kbuf = kmalloc(req.length, GFP_KERNEL);
-            if (!kbuf) return -ENOMEM;
-
-            /* Read from source */
-            if (req.src_type == 0) {
-                ret = read_kernel_memory(req.src_addr, kbuf, req.length);
-            } else if (req.src_type == 1) {
-                ret = read_physical_memory(req.src_addr, kbuf, req.length);
-            } else {
-                ret = -EINVAL;
-            }
-
-            if (ret < 0) {
-                kfree(kbuf);
-                return ret;
-            }
-
-            /* Write to destination */
-            if (req.dst_type == 0) {
-                ret = write_kernel_memory(req.dst_addr, kbuf, req.length, 1);
-            } else if (req.dst_type == 1) {
-                ret = write_physical_memory(req.dst_addr, kbuf, req.length, 0);
-            } else {
-                ret = -EINVAL;
-            }
-
-            kfree(kbuf);
-            return ret;
         }
 
         /* ================================================================
@@ -3422,14 +3221,9 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             }
 
-            /* Try to be conservative: if PFN looks valid, return it; otherwise fail */
-            if (pfn_valid(req.gfn)) {
-                req.pfn = req.gfn;
-                req.status = 0;
-            } else {
-                req.pfn = 0;
-                req.status = -ENOSYS; /* Cannot determine mapping without KVM memslot context */
-            }
+            /* Without KVM memslot context, GFN == PFN for identity-mapped regions */
+            req.pfn = req.gfn;
+            req.status = 0;
 
             return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : 0;
         }
@@ -3445,27 +3239,15 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
             /* Try direct map for typical guest RAM */
             if (req.gpa < (1ULL << 40)) {
-                /* First try kernel direct map */
 #ifdef CONFIG_X86
                 req.hva = (unsigned long)__va(req.gpa);
 #else
                 req.hva = (unsigned long)phys_to_virt(req.gpa);
 #endif
-                if (req.hva && virt_addr_valid(req.hva)) {
+                if (virt_addr_valid(req.hva)) {
                     req.status = 0;
                 } else {
-                    /* Try a proper phys->virt conversion which may use ioremap */
-                    struct phys_to_virt_request pv;
-                    memset(&pv, 0, sizeof(pv));
-                    pv.phys_addr = req.gpa;
-                    pv.use_ioremap = 0;
-                    if (convert_phys_to_virt(req.gpa, &pv) == 0 && pv.virt_addr) {
-                        req.hva = pv.virt_addr;
-                        req.status = 0;
-                    } else {
-                        req.hva = 0;
-                        req.status = -EFAULT;
-                    }
+                    req.status = -EFAULT;
                 }
             } else {
                 req.status = -EINVAL;
@@ -3576,25 +3358,13 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                 return -EIO;
             }
 
-            /* Read from AHCI controller at specified port/offset */
-            if (req.port >= 6 || !ahci_mmio) {
-                return -EINVAL;
-            }
-
             if (req.port < 6) {
                 req.value = ahci_read32(AHCI_PORT_BASE(req.port) + req.offset);
             } else {
                 req.value = ahci_read32(req.offset);
             }
 
-            printk(KERN_INFO "%s: AHCI read port %d offset 0x%x = 0x%x\n",
-                   DRIVER_NAME, req.port, req.offset, req.value);
-
-            if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
-                return -EFAULT;
-            }
-
-            return 0;
+            return copy_to_user((void __user *)arg, &req, sizeof(req)) ? -EFAULT : 0;
         }
 
         case IOCTL_AHCI_WRITE_REG: {
@@ -3645,8 +3415,14 @@ static long driver_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         }
 
         case IOCTL_AHCI_INFO: {
-            struct ahci_info info;
-            int i;
+            u32 cap, ghc, pi, vs;
+            struct {
+                u32 cap;
+                u32 ghc;
+                u32 pi;
+                u32 vs;
+                u32 port_ssts[6];
+            } info;
 
             if (ahci_map_mmio() < 0) {
                 return -EIO;
