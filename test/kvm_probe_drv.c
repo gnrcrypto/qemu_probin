@@ -1,12 +1,5 @@
 /*
  * KVM Probe Driver - Core Infrastructure
- * Builds KVM exploitation primitives step by step
- *
- * Step 1: Symbol Operations (Complete)
- * Step 2: Memory Read Operations (Complete)
- * Step 3: Memory Write Operations (Complete)
- * Step 4: Address Conversion (Complete)
- * Step 5: Hypercall Operations (Complete)
  */
 
 #include <linux/module.h>
@@ -871,25 +864,33 @@ static uint64_t do_hypercall_vmmcall(uint64_t nr, uint64_t a0, uint64_t a1,
 static uint64_t execute_hypercall(uint64_t nr, uint64_t a0, uint64_t a1,
                                    uint64_t a2, uint64_t a3)
 {
-    uint64_t result;
-    
-    /* Initialize hypercall type if not done */
-    if (g_hypercall_type == 0) {
-        g_hypercall_type = detect_hypercall_type();
-    }
-    
+uint64_t result;
+bool should_print = false;
+uint64_t mask_high = 0xffffffffffff0000ULL;
+
+/* Initialize hypercall type if not done */
+if (g_hypercall_type == 0) {
+    g_hypercall_type = detect_hypercall_type();
+}
+
+if (g_hypercall_type == 2) {
+    result = do_hypercall_vmmcall(nr, a0, a1, a2, a3);
+} else {
+    result = do_hypercall_vmcall(nr, a0, a1, a2, a3);
+}
+
+/* Only print if result is not 0 and not 0xffffffffffff**** */
+if (result != 0 && (result & mask_high) != mask_high) {
+    should_print = true;
+}
+
+if (should_print) {
     printk(KERN_DEBUG "%s: Executing hypercall %llu (a0=0x%llx, a1=0x%llx, a2=0x%llx, a3=0x%llx)\n",
            DRIVER_NAME, nr, a0, a1, a2, a3);
-    
-    if (g_hypercall_type == 2) {
-        result = do_hypercall_vmmcall(nr, a0, a1, a2, a3);
-    } else {
-        result = do_hypercall_vmcall(nr, a0, a1, a2, a3);
-    }
-    
     printk(KERN_DEBUG "%s: Hypercall %llu returned 0x%llx\n", DRIVER_NAME, nr, result);
-    
-    return result;
+}
+
+return result;
 }
 
 /*
@@ -898,6 +899,9 @@ static uint64_t execute_hypercall(uint64_t nr, uint64_t a0, uint64_t a1,
  */
 static void execute_hypercall_batch(struct hypercall_batch_request *batch)
 {
+    bool should_print = false;
+    uint64_t mask_high = 0xffffffffffff0000ULL;
+    
     /* HC 100: Usually read flag or status */
     batch->r100 = execute_hypercall(100, 0, 0, 0, 0);
     
@@ -910,8 +914,18 @@ static void execute_hypercall_batch(struct hypercall_batch_request *batch)
     /* HC 103: Usually DoS or special command */
     batch->r103 = execute_hypercall(103, 0, 0, 0, 0);
     
-    printk(KERN_INFO "%s: Batch hypercalls: HC100=0x%llx HC101=0x%llx HC102=0x%llx HC103=0x%llx\n",
-           DRIVER_NAME, batch->r100, batch->r101, batch->r102, batch->r103);
+    /* Only print if any result is not 0 and not 0xffffffffffff**** */
+    if ((batch->r100 != 0 && (batch->r100 & mask_high) != mask_high) ||
+        (batch->r101 != 0 && (batch->r101 & mask_high) != mask_high) ||
+        (batch->r102 != 0 && (batch->r102 & mask_high) != mask_high) ||
+        (batch->r103 != 0 && (batch->r103 & mask_high) != mask_high)) {
+        should_print = true;
+    }
+    
+    if (should_print) {
+        printk(KERN_INFO "%s: Batch hypercalls: HC100=0x%llx HC101=0x%llx HC102=0x%llx HC103=0x%llx\n",
+               DRIVER_NAME, batch->r100, batch->r101, batch->r102, batch->r103);
+    }
 }
 
 #else /* !CONFIG_X86 */
